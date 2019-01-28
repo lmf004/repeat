@@ -774,7 +774,7 @@ bool GetTransaction(const uint256& hash, CTransactionRef& txOut, const Consensus
             return true;
         }
 
-        if (g_txindex) {
+        if (g_txindex) { //@@@@@@@@@@@@@@@@@@@@@@@@@@
             return g_txindex->FindTx(hash, hashBlock, txOut);
         }
 
@@ -968,6 +968,213 @@ public:
     void Stop();
 };
 
+void BaseIndex::Start()
+{
+    // Need to register this ValidationInterface before running Init(), so that
+    // callbacks are not missed if Init sets m_synced to true.
+    RegisterValidationInterface(this);
+    if (!Init()) {
+        FatalError("%s: %s failed to initialize", __func__, GetName());
+        return;
+    }
+
+    m_thread_sync = std::thread(&TraceThread<std::function<void()>>, GetName(),
+                                std::bind(&BaseIndex::ThreadSync, this));
+}
+
+void BaseIndex::Stop()
+{
+    UnregisterValidationInterface(this);
+
+    if (m_thread_sync.joinable()) {
+        m_thread_sync.join();
+    }
+}
+
+bool BaseIndex::Init()
+{
+    CBlockLocator locator;
+    if (!GetDB().ReadBestBlock(locator)) {
+        locator.SetNull();
+    }
+
+    LOCK(cs_main);
+    if (locator.IsNull()) {
+        m_best_block_index = nullptr;
+    } else {
+        m_best_block_index = FindForkInGlobalIndex(chainActive, locator);
+    }
+    m_synced = m_best_block_index.load() == chainActive.Tip(); //@@@@@@@@@@@@@@@@@@@@@@@@@@
+    return true;
+}
+
+void BaseIndex::ThreadSync()
+{
+    const CBlockIndex* pindex = m_best_block_index.load();
+    if (!m_synced) {
+        auto& consensus_params = Params().GetConsensus();
+
+        int64_t last_log_time = 0;
+        int64_t last_locator_write_time = 0;
+        while (true) {
+            if (m_interrupt) {
+                WriteBestBlock(pindex);
+                return;
+            }
+
+            {
+                LOCK(cs_main);
+                const CBlockIndex* pindex_next = NextSyncBlock(pindex);
+                if (!pindex_next) {
+                    WriteBestBlock(pindex);
+                    m_best_block_index = pindex;
+                    m_synced = true;
+                    break;
+                }
+                pindex = pindex_next;
+            }
+
+            int64_t current_time = GetTime();
+            if (last_log_time + SYNC_LOG_INTERVAL < current_time) {
+                LogPrintf("Syncing %s with block chain from height %d\n",
+                          GetName(), pindex->nHeight);
+                last_log_time = current_time;
+            }
+
+            if (last_locator_write_time + SYNC_LOCATOR_WRITE_INTERVAL < current_time) {
+                WriteBestBlock(pindex);
+                last_locator_write_time = current_time;
+            }
+
+            CBlock block;
+            if (!ReadBlockFromDisk(block, pindex, consensus_params)) { //@@@@@@@@@@@@@@@@@@@@@@@@@
+                FatalError("%s: Failed to read block %s from disk",
+                           __func__, pindex->GetBlockHash().ToString());
+                return;
+            }
+	    /// Write update index entries for a newly connected block.
+            if (!WriteBlock(block, pindex)) { //@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+                FatalError("%s: Failed to write block %s to index database",
+                           __func__, pindex->GetBlockHash().ToString());
+                return;
+            }
+        }
+    }
+
+    if (pindex) {
+        LogPrintf("%s is enabled at height %d\n", GetName(), pindex->nHeight);
+    } else {
+        LogPrintf("%s is enabled\n", GetName());
+    }
+}
+
+// validation.cpp ##############################
+bool ReadBlockFromDisk(CBlock& block, const CBlockIndex* pindex, const Consensus::Params& consensusParams)
+{
+    CDiskBlockPos blockPos;
+    {
+        LOCK(cs_main);
+        blockPos = pindex->GetBlockPos(); //@@@@@@@@@@@@@@@@@@@@@@
+    }
+
+    if (!ReadBlockFromDisk(block, blockPos, consensusParams))
+        return false;
+    if (block.GetHash() != pindex->GetBlockHash())
+        return error("ReadBlockFromDisk(CBlock&, CBlockIndex*): GetHash() doesn't match index for %s at %s",
+                pindex->ToString(), pindex->GetBlockPos().ToString());
+    return true;
+}
+
+// rpc/rawtransaction.cpp ###########################
+static UniValue getrawtransaction(const JSONRPCRequest& request)
+{
+    bool in_active_chain = true;
+    uint256 hash = ParseHashV(request.params[0], "parameter 1");
+    CBlockIndex* blockindex = nullptr;
+    
+    if (!request.params[2].isNull()) {
+        uint256 blockhash = ParseHashV(request.params[2], "parameter 3");
+        blockindex = LookupBlockIndex(blockhash);
+        if (!blockindex) {
+            throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, "Block hash not found");
+        }
+        in_active_chain = chainActive.Contains(blockindex);
+    }
+
+    bool f_txindex_ready = false;
+    if (g_txindex && !blockindex) {
+      f_txindex_ready = g_txindex->BlockUntilSyncedToCurrentChain(); //@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+    }
+
+    CTransactionRef tx;
+    uint256 hash_block;
+    if (!GetTransaction(hash, tx, Params().GetConsensus(), hash_block, true, blockindex)) {
+        std::string errmsg;
+        if (blockindex) {
+            if (!(blockindex->nStatus & BLOCK_HAVE_DATA)) {
+                throw JSONRPCError(RPC_MISC_ERROR, "Block not available");
+            }
+            errmsg = "No such transaction found in the provided block";
+        } else if (!g_txindex) {
+            errmsg = "No such mempool transaction. Use -txindex to enable blockchain transaction queries";
+        } else if (!f_txindex_ready) {
+            errmsg = "No such mempool transaction. Blockchain transactions are still in the process of being indexed";
+        } else {
+            errmsg = "No such mempool or blockchain transaction";
+        }
+        throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, errmsg + ". Use gettransaction for wallet transactions.");
+    }
+
+    if (!fVerbose) {
+        return EncodeHexTx(*tx, RPCSerializationFlags());
+    }
+
+    UniValue result(UniValue::VOBJ);
+    if (blockindex) result.pushKV("in_active_chain", in_active_chain);
+    TxToJSON(*tx, hash_block, result);
+    return result;
+}
+
+// index/base.cpp #################################
+bool BaseIndex::BlockUntilSyncedToCurrentChain()
+{
+    AssertLockNotHeld(cs_main);
+
+    if (!m_synced) {
+        return false;
+    }
+
+    {
+        // Skip the queue-draining stuff if we know we're caught up with
+        // chainActive.Tip().
+        LOCK(cs_main);
+        const CBlockIndex* chain_tip = chainActive.Tip();
+        const CBlockIndex* best_block_index = m_best_block_index.load();
+        if (best_block_index->GetAncestor(chain_tip->nHeight) == chain_tip) {
+            return true;
+        }
+    }
+
+    LogPrintf("%s: %s is catching up on block notifications\n", __func__, GetName());
+    SyncWithValidationInterfaceQueue();
+    return true;
+}
+
+// validationinterface.cpp ######################
+void CallFunctionInValidationInterfaceQueue(std::function<void ()> func) {
+    g_signals.m_internals->m_schedulerClient.AddToProcessQueue(std::move(func));
+}
+void SyncWithValidationInterfaceQueue() {
+    AssertLockNotHeld(cs_main);
+    // Block until the validation queue drains
+    std::promise<void> promise;
+    CallFunctionInValidationInterfaceQueue([&promise] {
+        promise.set_value();
+    });
+    promise.get_future().wait();
+}
+
+
 //----------------------------------------------------------------------------------------------------
 //----------------------------------------------------------------------------------------------------
 //----------------------------------------------------------------------------------------------------
@@ -1068,3 +1275,30 @@ uint256 BlockWitnessMerkleRoot(const CBlock& block, bool* mutated)
     return ComputeMerkleRoot(std::move(leaves), mutated);
 }
 
+/**
+ * .. and a wrapper that just calls func once
+ */
+template <typename Callable> void TraceThread(const char* name,  Callable func)
+{
+    std::string s = strprintf("bitcoin-%s", name);
+    RenameThread(s.c_str());
+    try
+    {
+        LogPrintf("%s thread start\n", name);
+        func();
+        LogPrintf("%s thread exit\n", name);
+    }
+    catch (const boost::thread_interrupted&)
+    {
+        LogPrintf("%s thread interrupt\n", name);
+        throw;
+    }
+    catch (const std::exception& e) {
+        PrintExceptionContinue(&e, name);
+        throw;
+    }
+    catch (...) {
+        PrintExceptionContinue(nullptr, name);
+        throw;
+    }
+}
