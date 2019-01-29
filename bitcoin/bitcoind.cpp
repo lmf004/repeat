@@ -1174,6 +1174,438 @@ void SyncWithValidationInterfaceQueue() {
     promise.get_future().wait();
 }
 
+//----------------------------------------------------------------------------------------------------
+//----------------------------------------------------------------------------------------------------
+//----------------------------------------------------------------------------------------------------
+
+// index/base.cpp #############################
+void BaseIndex::BlockConnected(const std::shared_ptr<const CBlock>& block, const CBlockIndex* pindex,
+                               const std::vector<CTransactionRef>& txn_conflicted)
+{
+    if (!m_synced) {
+        return;
+    }
+
+    const CBlockIndex* best_block_index = m_best_block_index.load();
+    if (!best_block_index) {
+        if (pindex->nHeight != 0) {
+            FatalError("%s: First block connected is not the genesis block (height=%d)", __func__, pindex->nHeight);
+            return;
+        }
+    } else {
+        // Ensure block connects to an ancestor of the current best block. This should be the case
+        // most of the time, but may not be immediately after the sync thread catches up and sets
+        // m_synced. Consider the case where there is a reorg and the blocks on the stale branch are
+        // in the ValidationInterface queue backlog even after the sync thread has caught up to the
+        // new chain tip. In this unlikely event, log a warning and let the queue clear.
+        if (best_block_index->GetAncestor(pindex->nHeight - 1) != pindex->pprev) {
+            LogPrintf("%s: WARNING: Block %s does not connect to an ancestor of " /* Continued */
+                      "known best chain (tip=%s); not updating index\n",
+                      __func__, pindex->GetBlockHash().ToString(),
+                      best_block_index->GetBlockHash().ToString());
+            return;
+        }
+    }
+
+    if (WriteBlock(*block, pindex)) { //@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+        m_best_block_index = pindex;
+    } else {
+        FatalError("%s: Failed to write block %s to index", __func__, pindex->GetBlockHash().ToString());
+        return;
+    }
+}
+
+/**
+ * Make the best chain active, in multiple steps. The result is either failure
+ * or an activated best chain. pblock is either nullptr or a pointer to a block
+ * that is already loaded (to avoid loading it again from disk).
+ *
+ * ActivateBestChain is split into steps (see ActivateBestChainStep) so that
+ * we avoid holding cs_main for an extended period of time; the length of this
+ * call may be quite long during reindexing or a substantial reorg.
+ */
+bool CChainState::ActivateBestChain(CValidationState &state, const CChainParams& chainparams, std::shared_ptr<const CBlock> pblock) {
+    // Note that while we're often called here from ProcessNewBlock, this is
+    // far from a guarantee. Things in the P2P/RPC will often end up calling
+    // us in the middle of ProcessNewBlock - do not assume pblock is set
+    // sanely for performance or correctness!
+    AssertLockNotHeld(cs_main);
+
+    // ABC maintains a fair degree of expensive-to-calculate internal state
+    // because this function periodically releases cs_main so that it does not lock up other threads for too long
+    // during large connects - and to allow for e.g. the callback queue to drain
+    // we use m_cs_chainstate to enforce mutual exclusion so that only one caller may execute this function at a time
+    LOCK(m_cs_chainstate);
+
+    CBlockIndex *pindexMostWork = nullptr;
+    CBlockIndex *pindexNewTip = nullptr;
+    int nStopAtHeight = gArgs.GetArg("-stopatheight", DEFAULT_STOPATHEIGHT);
+    do {
+        boost::this_thread::interruption_point();
+
+        if (GetMainSignals().CallbacksPending() > 10) {
+            // Block until the validation queue drains. This should largely
+            // never happen in normal operation, however may happen during
+            // reindex, causing memory blowup if we run too far ahead.
+            // Note that if a validationinterface callback ends up calling
+            // ActivateBestChain this may lead to a deadlock! We should
+            // probably have a DEBUG_LOCKORDER test for this in the future.
+            SyncWithValidationInterfaceQueue();
+        }
+
+        {
+            LOCK(cs_main);
+            CBlockIndex* starting_tip = chainActive.Tip();
+            bool blocks_connected = false;
+            do {
+                // We absolutely may not unlock cs_main until we've made forward progress
+                // (with the exception of shutdown due to hardware issues, low disk space, etc).
+                ConnectTrace connectTrace(mempool); // Destructed before cs_main is unlocked
+
+                if (pindexMostWork == nullptr) {
+                    pindexMostWork = FindMostWorkChain();
+                }
+
+                // Whether we have anything to do at all.
+                if (pindexMostWork == nullptr || pindexMostWork == chainActive.Tip()) {
+                    break;
+                }
+
+                bool fInvalidFound = false;
+                std::shared_ptr<const CBlock> nullBlockPtr;
+                if (!ActivateBestChainStep(state, chainparams, pindexMostWork, pblock && pblock->GetHash() == pindexMostWork->GetBlockHash() ? pblock : nullBlockPtr, fInvalidFound, connectTrace))
+                    return false;
+                blocks_connected = true;
+
+                if (fInvalidFound) {
+                    // Wipe cache, we may need another branch now.
+                    pindexMostWork = nullptr;
+                }
+                pindexNewTip = chainActive.Tip();
+
+                for (const PerBlockConnectTrace& trace : connectTrace.GetBlocksConnected()) {
+                    assert(trace.pblock && trace.pindex);
+                    GetMainSignals().BlockConnected(trace.pblock, trace.pindex, trace.conflictedTxs);
+                }
+            } while (!chainActive.Tip() || (starting_tip && CBlockIndexWorkComparator()(chainActive.Tip(), starting_tip)));
+            if (!blocks_connected) return true;
+
+            const CBlockIndex* pindexFork = chainActive.FindFork(starting_tip);
+            bool fInitialDownload = IsInitialBlockDownload();
+
+            // Notify external listeners about the new tip.
+            // Enqueue while holding cs_main to ensure that UpdatedBlockTip is called in the order in which blocks are connected
+            if (pindexFork != pindexNewTip) {
+                // Notify ValidationInterface subscribers
+                GetMainSignals().UpdatedBlockTip(pindexNewTip, pindexFork, fInitialDownload);
+
+                // Always notify the UI if a new block tip was connected
+                uiInterface.NotifyBlockTip(fInitialDownload, pindexNewTip);
+            }
+        }
+        // When we reach this point, we switched to a new tip (stored in pindexNewTip).
+
+        if (nStopAtHeight && pindexNewTip && pindexNewTip->nHeight >= nStopAtHeight) StartShutdown();
+
+        // We check shutdown only after giving ActivateBestChainStep a chance to run once so that we
+        // never shutdown before connecting the genesis block during LoadChainTip(). Previously this
+        // caused an assert() failure during shutdown in such cases as the UTXO DB flushing checks
+        // that the best block hash is non-null.
+        if (ShutdownRequested())
+            break;
+    } while (pindexNewTip != pindexMostWork);
+    CheckBlockIndex(chainparams.GetConsensus());
+
+    // Write changes periodically to disk, after relay.
+    if (!FlushStateToDisk(chainparams, state, FlushStateMode::PERIODIC)) {
+        return false;
+    }
+
+    return true;
+}
+
+bool ActivateBestChain(CValidationState &state, const CChainParams& chainparams, std::shared_ptr<const CBlock> pblock) {
+    return g_chainstate.ActivateBestChain(state, chainparams, std::move(pblock));
+}
+
+/**
+ * Return the tip of the chain with the most work in it, that isn't
+ * known to be invalid (it's however far from certain to be valid).
+ */
+CBlockIndex* CChainState::FindMostWorkChain() {
+    do {
+        CBlockIndex *pindexNew = nullptr;
+
+        // Find the best candidate header.
+        {
+            std::set<CBlockIndex*, CBlockIndexWorkComparator>::reverse_iterator it = setBlockIndexCandidates.rbegin();
+            if (it == setBlockIndexCandidates.rend())
+                return nullptr;
+            pindexNew = *it;
+        }
+
+        // Check whether all blocks on the path between the currently active chain and the candidate are valid.
+        // Just going until the active chain is an optimization, as we know all blocks in it are valid already.
+        CBlockIndex *pindexTest = pindexNew;
+        bool fInvalidAncestor = false;
+        while (pindexTest && !chainActive.Contains(pindexTest)) {
+            assert(pindexTest->HaveTxsDownloaded() || pindexTest->nHeight == 0);
+
+            // Pruned nodes may have entries in setBlockIndexCandidates for
+            // which block files have been deleted.  Remove those as candidates
+            // for the most work chain if we come across them; we can't switch
+            // to a chain unless we have all the non-active-chain parent blocks.
+            bool fFailedChain = pindexTest->nStatus & BLOCK_FAILED_MASK;
+            bool fMissingData = !(pindexTest->nStatus & BLOCK_HAVE_DATA);
+            if (fFailedChain || fMissingData) {
+                // Candidate chain is not usable (either invalid or missing data)
+                if (fFailedChain && (pindexBestInvalid == nullptr || pindexNew->nChainWork > pindexBestInvalid->nChainWork))
+                    pindexBestInvalid = pindexNew;
+                CBlockIndex *pindexFailed = pindexNew;
+                // Remove the entire chain from the set.
+                while (pindexTest != pindexFailed) {
+                    if (fFailedChain) {
+                        pindexFailed->nStatus |= BLOCK_FAILED_CHILD;
+                    } else if (fMissingData) {
+                        // If we're missing data, then add back to mapBlocksUnlinked,
+                        // so that if the block arrives in the future we can try adding
+                        // to setBlockIndexCandidates again.
+                        mapBlocksUnlinked.insert(std::make_pair(pindexFailed->pprev, pindexFailed));
+                    }
+                    setBlockIndexCandidates.erase(pindexFailed);
+                    pindexFailed = pindexFailed->pprev;
+                }
+                setBlockIndexCandidates.erase(pindexTest);
+                fInvalidAncestor = true;
+                break;
+            }
+            pindexTest = pindexTest->pprev;
+        }
+        if (!fInvalidAncestor)
+            return pindexNew;
+    } while(true);
+}
+
+//----------------------------------------------------------------------------------------------------
+//----------------------------------------------------------------------------------------------------
+//----------------------------------------------------------------------------------------------------
+
+// coins.cpp #######################
+void CCoinsViewCache::AddCoin(const COutPoint &outpoint, Coin&& coin, bool possible_overwrite) {
+    assert(!coin.IsSpent());
+    if (coin.out.scriptPubKey.IsUnspendable()) return;
+    CCoinsMap::iterator it;
+    bool inserted;
+    std::tie(it, inserted) = cacheCoins.emplace(std::piecewise_construct, std::forward_as_tuple(outpoint), std::tuple<>());
+    bool fresh = false;
+    if (!inserted) {
+        cachedCoinsUsage -= it->second.coin.DynamicMemoryUsage();
+    }
+    if (!possible_overwrite) {
+        if (!it->second.coin.IsSpent()) {
+            throw std::logic_error("Adding new coin that replaces non-pruned entry");
+        }
+        fresh = !(it->second.flags & CCoinsCacheEntry::DIRTY);
+    }
+    it->second.coin = std::move(coin);
+    it->second.flags |= CCoinsCacheEntry::DIRTY | (fresh ? CCoinsCacheEntry::FRESH : 0);
+    cachedCoinsUsage += it->second.coin.DynamicMemoryUsage();
+}
+
+CCoinsMap::iterator CCoinsViewCache::FetchCoin(const COutPoint &outpoint) const {
+    CCoinsMap::iterator it = cacheCoins.find(outpoint);
+    if (it != cacheCoins.end())
+        return it;
+    Coin tmp;
+    if (!base->GetCoin(outpoint, tmp))
+        return cacheCoins.end();
+    CCoinsMap::iterator ret = cacheCoins.emplace(std::piecewise_construct, std::forward_as_tuple(outpoint), std::forward_as_tuple(std::move(tmp))).first;
+    if (ret->second.coin.IsSpent()) {
+        // The parent only has an empty entry for this outpoint; we can consider our
+        // version as fresh.
+        ret->second.flags = CCoinsCacheEntry::FRESH;
+    }
+    cachedCoinsUsage += ret->second.coin.DynamicMemoryUsage();
+    return ret;
+}
+
+/** Abstract view on the open txout dataset. */
+class CCoinsView
+{
+public:
+    /** Retrieve the Coin (unspent transaction output) for a given outpoint.
+     *  Returns true only when an unspent coin was found, which is returned in coin.
+     *  When false is returned, coin's value is unspecified.
+     */
+    virtual bool GetCoin(const COutPoint &outpoint, Coin &coin) const;
+
+    //! Just check whether a given outpoint is unspent.
+    virtual bool HaveCoin(const COutPoint &outpoint) const;
+
+    //! Retrieve the block hash whose state this CCoinsView currently represents
+    virtual uint256 GetBestBlock() const;
+
+    //! Retrieve the range of blocks that may have been only partially written.
+    //! If the database is in a consistent state, the result is the empty vector.
+    //! Otherwise, a two-element vector is returned consisting of the new and
+    //! the old block hash, in that order.
+    virtual std::vector<uint256> GetHeadBlocks() const;
+
+    //! Do a bulk modification (multiple Coin changes + BestBlock change).
+    //! The passed mapCoins can be modified.
+    virtual bool BatchWrite(CCoinsMap &mapCoins, const uint256 &hashBlock);
+
+    //! Get a cursor to iterate over the whole state
+    virtual CCoinsViewCursor *Cursor() const;
+
+    //! As we use CCoinsViews polymorphically, have a virtual destructor
+    virtual ~CCoinsView() {}
+
+    //! Estimate database size (0 if not implemented)
+    virtual size_t EstimateSize() const { return 0; }
+};
+
+
+/** CCoinsView backed by another CCoinsView */
+class CCoinsViewBacked : public CCoinsView
+{
+protected:
+    CCoinsView *base;
+
+public:
+    CCoinsViewBacked(CCoinsView *viewIn);
+    bool GetCoin(const COutPoint &outpoint, Coin &coin) const override;
+    bool HaveCoin(const COutPoint &outpoint) const override;
+    uint256 GetBestBlock() const override;
+    std::vector<uint256> GetHeadBlocks() const override;
+    void SetBackend(CCoinsView &viewIn);
+    bool BatchWrite(CCoinsMap &mapCoins, const uint256 &hashBlock) override;
+    CCoinsViewCursor *Cursor() const override;
+    size_t EstimateSize() const override;
+};
+
+
+/** CCoinsView that adds a memory cache for transactions to another CCoinsView */
+class CCoinsViewCache : public CCoinsViewBacked
+{
+protected:
+    /**
+     * Make mutable so that we can "fill the cache" even from Get-methods
+     * declared as "const".
+     */
+    mutable uint256 hashBlock;
+    mutable CCoinsMap cacheCoins;
+
+    /* Cached dynamic memory usage for the inner Coin objects. */
+    mutable size_t cachedCoinsUsage;
+
+public:
+    CCoinsViewCache(CCoinsView *baseIn);
+
+    /**
+     * By deleting the copy constructor, we prevent accidentally using it when one intends to create a cache on top of a base cache.
+     */
+    CCoinsViewCache(const CCoinsViewCache &) = delete;
+
+    // Standard CCoinsView methods
+    bool GetCoin(const COutPoint &outpoint, Coin &coin) const override;
+    bool HaveCoin(const COutPoint &outpoint) const override;
+    uint256 GetBestBlock() const override;
+    void SetBestBlock(const uint256 &hashBlock);
+    bool BatchWrite(CCoinsMap &mapCoins, const uint256 &hashBlock) override;
+    CCoinsViewCursor* Cursor() const override {
+        throw std::logic_error("CCoinsViewCache cursor iteration not supported.");
+    }
+
+    /**
+     * Check if we have the given utxo already loaded in this cache.
+     * The semantics are the same as HaveCoin(), but no calls to
+     * the backing CCoinsView are made.
+     */
+    bool HaveCoinInCache(const COutPoint &outpoint) const;
+
+    /**
+     * Return a reference to Coin in the cache, or a pruned one if not found. This is
+     * more efficient than GetCoin.
+     *
+     * Generally, do not hold the reference returned for more than a short scope.
+     * While the current implementation allows for modifications to the contents
+     * of the cache while holding the reference, this behavior should not be relied
+     * on! To be safe, best to not hold the returned reference through any other
+     * calls to this cache.
+     */
+    const Coin& AccessCoin(const COutPoint &output) const;
+
+    /**
+     * Add a coin. Set potential_overwrite to true if a non-pruned version may
+     * already exist.
+     */
+    void AddCoin(const COutPoint& outpoint, Coin&& coin, bool potential_overwrite);
+
+    /**
+     * Spend a coin. Pass moveto in order to get the deleted data.
+     * If no unspent output exists for the passed outpoint, this call
+     * has no effect.
+     */
+    bool SpendCoin(const COutPoint &outpoint, Coin* moveto = nullptr);
+
+    /**
+     * Push the modifications applied to this cache to its base.
+     * Failure to call this method before destruction will cause the changes to be forgotten.
+     * If false is returned, the state of this cache (and its backing view) will be undefined.
+     */
+    bool Flush();
+
+    /**
+     * Removes the UTXO with the given outpoint from the cache, if it is
+     * not modified.
+     */
+    void Uncache(const COutPoint &outpoint);
+
+    //! Calculate the size of the cache (in number of transaction outputs)
+    unsigned int GetCacheSize() const;
+
+    //! Calculate the size of the cache (in bytes)
+    size_t DynamicMemoryUsage() const;
+
+    /**
+     * Amount of bitcoins coming in to a transaction
+     * Note that lightweight clients may not know anything besides the hash of previous transactions,
+     * so may not be able to calculate this.
+     *
+     * @param[in] tx    transaction for which we are checking input total
+     * @return  Sum of value of all inputs (scriptSigs)
+     */
+    CAmount GetValueIn(const CTransaction& tx) const;
+
+    //! Check whether all prevouts of the transaction are present in the UTXO set represented by this view
+    bool HaveInputs(const CTransaction& tx) const;
+
+private:
+    CCoinsMap::iterator FetchCoin(const COutPoint &outpoint) const;
+};
+
+//----------------------------------------------------------------------------------------------------
+//----------------------------------------------------------------------------------------------------
+//----------------------------------------------------------------------------------------------------
+
+/*
+-reindex:
+
+wipes the chainstate (the UTXO set)
+wipes the block index (the database with information about which block is where on disk)
+rebuilds the block index (by going over all blk*.dat files, and finding things in it that look like blocks)
+rebuilds the chainstate (redoing all validation for blocks) based on the blocks now in the index
+
+-reindex-chainstate:
+
+wipes the chainstate
+rebuilds the chainstate using the blocks in the index you had before
+
+The latter should be strictly faster, as it does not need to rebuild the block index first. Perhaps the progress bar during reindex confuses you: that progress is only for the rebuilding of the index. The recreation of the chainstate happens after that rebuild is completed.
+You should use -reindex only when you were running in pruning mode, or if you suspect the blocks on disk are actually corrupted. Otherwise, when you only suspect corruption of the chainstate (which is far more likely), use -reindex-chainstate.
+
+*/
 
 //----------------------------------------------------------------------------------------------------
 //----------------------------------------------------------------------------------------------------
