@@ -1263,7 +1263,7 @@ bool CChainState::ActivateBestChain(CValidationState &state, const CChainParams&
                 ConnectTrace connectTrace(mempool); // Destructed before cs_main is unlocked
 
                 if (pindexMostWork == nullptr) {
-                    pindexMostWork = FindMostWorkChain();
+		  pindexMostWork = FindMostWorkChain(); //@@@@@@@@@@@@@@@@@@@@@@@@@@@@
                 }
 
                 // Whether we have anything to do at all.
@@ -1273,6 +1273,7 @@ bool CChainState::ActivateBestChain(CValidationState &state, const CChainParams&
 
                 bool fInvalidFound = false;
                 std::shared_ptr<const CBlock> nullBlockPtr;
+		//@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
                 if (!ActivateBestChainStep(state, chainparams, pindexMostWork, pblock && pblock->GetHash() == pindexMostWork->GetBlockHash() ? pblock : nullBlockPtr, fInvalidFound, connectTrace))
                     return false;
                 blocks_connected = true;
@@ -1386,11 +1387,347 @@ CBlockIndex* CChainState::FindMostWorkChain() {
     } while(true);
 }
 
+/**
+ * Try to make some progress towards making pindexMostWork the active block.
+ * pblock is either nullptr or a pointer to a CBlock corresponding to pindexMostWork.
+ */
+bool CChainState::ActivateBestChainStep(CValidationState& state, const CChainParams& chainparams, CBlockIndex* pindexMostWork, const std::shared_ptr<const CBlock>& pblock, bool& fInvalidFound, ConnectTrace& connectTrace)
+{
+    AssertLockHeld(cs_main);
+
+    const CBlockIndex *pindexOldTip = chainActive.Tip();
+    const CBlockIndex *pindexFork = chainActive.FindFork(pindexMostWork);
+
+    // Disconnect active blocks which are no longer in the best chain.
+    bool fBlocksDisconnected = false;
+    DisconnectedBlockTransactions disconnectpool;
+    while (chainActive.Tip() && chainActive.Tip() != pindexFork) {
+      if (!DisconnectTip(state, chainparams, &disconnectpool)) { //@@@@@@@@@@@@@@@@@@@@@@@@@@
+            // This is likely a fatal error, but keep the mempool consistent,
+            // just in case. Only remove from the mempool in this case.
+            UpdateMempoolForReorg(disconnectpool, false);
+            return false;
+        }
+        fBlocksDisconnected = true;
+    }
+
+    // Build list of new blocks to connect.
+    std::vector<CBlockIndex*> vpindexToConnect;
+    bool fContinue = true;
+    int nHeight = pindexFork ? pindexFork->nHeight : -1;
+    while (fContinue && nHeight != pindexMostWork->nHeight) {
+        // Don't iterate the entire list of potential improvements toward the best tip, as we likely only need
+        // a few blocks along the way.
+        int nTargetHeight = std::min(nHeight + 32, pindexMostWork->nHeight);
+        vpindexToConnect.clear();
+        vpindexToConnect.reserve(nTargetHeight - nHeight);
+        CBlockIndex *pindexIter = pindexMostWork->GetAncestor(nTargetHeight);
+        while (pindexIter && pindexIter->nHeight != nHeight) {
+            vpindexToConnect.push_back(pindexIter);
+            pindexIter = pindexIter->pprev;
+        }
+        nHeight = nTargetHeight;
+
+        // Connect new blocks.
+        for (CBlockIndex *pindexConnect : reverse_iterate(vpindexToConnect)) {
+	    //@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+            if (!ConnectTip(state, chainparams, pindexConnect, pindexConnect == pindexMostWork ? pblock : std::shared_ptr<const CBlock>(), connectTrace, disconnectpool)) {
+                if (state.IsInvalid()) {
+                    // The block violates a consensus rule.
+                    if (!state.CorruptionPossible()) {
+                        InvalidChainFound(vpindexToConnect.front());
+                    }
+                    state = CValidationState();
+                    fInvalidFound = true;
+                    fContinue = false;
+                    break;
+                } else {
+                    // A system error occurred (disk space, database error, ...).
+                    // Make the mempool consistent with the current tip, just in case
+                    // any observers try to use it before shutdown.
+                    UpdateMempoolForReorg(disconnectpool, false);
+                    return false;
+                }
+            } else {
+                PruneBlockIndexCandidates();
+                if (!pindexOldTip || chainActive.Tip()->nChainWork > pindexOldTip->nChainWork) {
+                    // We're in a better position than we were. Return temporarily to release the lock.
+                    fContinue = false;
+                    break;
+                }
+            }
+        }
+    }
+
+    if (fBlocksDisconnected) {
+        // If any blocks were disconnected, disconnectpool may be non empty.  Add
+        // any disconnected transactions back to the mempool.
+        UpdateMempoolForReorg(disconnectpool, true);
+    }
+    mempool.check(pcoinsTip.get());
+
+    // Callbacks/notifications for a new best chain.
+    if (fInvalidFound)
+        CheckForkWarningConditionsOnNewFork(vpindexToConnect.back());
+    else
+        CheckForkWarningConditions();
+
+    return true;
+}
+
 //----------------------------------------------------------------------------------------------------
 //----------------------------------------------------------------------------------------------------
 //----------------------------------------------------------------------------------------------------
 
-// coins.cpp #######################
+// validation.cpp #########################
+std::unique_ptr<CCoinsViewDB> pcoinsdbview;
+std::unique_ptr<CCoinsViewCache> pcoinsTip;
+std::unique_ptr<CBlockTreeDB> pblocktree;
+
+// init.cpp ##########################
+void AppInitMain()
+{
+  pcoinsdbview.reset(new CCoinsViewDB(nCoinDBCache, false, fReset || fReindexChainState));
+  pcoinscatcher.reset(new CCoinsViewErrorCatcher(pcoinsdbview.get()));
+  pcoinsTip.reset(new CCoinsViewCache(pcoinscatcher.get()));
+  
+}
+
+// validation.cpp ####################
+bool CChainState::ConnectTip(CValidationState& state, const CChainParams& chainparams, CBlockIndex* pindexNew, const std::shared_ptr<const CBlock>& pblock, ConnectTrace& connectTrace, DisconnectedBlockTransactions &disconnectpool)
+{
+    assert(pindexNew->pprev == chainActive.Tip());
+    // Read block from disk.
+    int64_t nTime1 = GetTimeMicros();
+    std::shared_ptr<const CBlock> pthisBlock;
+    if (!pblock) {
+        std::shared_ptr<CBlock> pblockNew = std::make_shared<CBlock>();
+        if (!ReadBlockFromDisk(*pblockNew, pindexNew, chainparams.GetConsensus()))
+            return AbortNode(state, "Failed to read block");
+        pthisBlock = pblockNew;
+    } else {
+        pthisBlock = pblock;
+    }
+    const CBlock& blockConnecting = *pthisBlock;
+    // Apply the block atomically to the chain state.
+    int64_t nTime2 = GetTimeMicros(); nTimeReadFromDisk += nTime2 - nTime1;
+    int64_t nTime3;
+    LogPrint(BCLog::BENCH, "  - Load block from disk: %.2fms [%.2fs]\n", (nTime2 - nTime1) * MILLI, nTimeReadFromDisk * MICRO);
+    {
+      CCoinsViewCache view(pcoinsTip.get()); //@@@@@@@@@@@@@@@@@@@@@@@@@@
+        bool rv = ConnectBlock(blockConnecting, state, pindexNew, view, chainparams);
+        GetMainSignals().BlockChecked(blockConnecting, state);
+        if (!rv) {
+            if (state.IsInvalid())
+                InvalidBlockFound(pindexNew, state);
+            return error("%s: ConnectBlock %s failed, %s", __func__, pindexNew->GetBlockHash().ToString(), FormatStateMessage(state));
+        }
+        nTime3 = GetTimeMicros(); nTimeConnectTotal += nTime3 - nTime2;
+        LogPrint(BCLog::BENCH, "  - Connect total: %.2fms [%.2fs (%.2fms/blk)]\n", (nTime3 - nTime2) * MILLI, nTimeConnectTotal * MICRO, nTimeConnectTotal * MILLI / nBlocksTotal);
+        bool flushed = view.Flush();
+        assert(flushed);
+    }
+    int64_t nTime4 = GetTimeMicros(); nTimeFlush += nTime4 - nTime3;
+    LogPrint(BCLog::BENCH, "  - Flush: %.2fms [%.2fs (%.2fms/blk)]\n", (nTime4 - nTime3) * MILLI, nTimeFlush * MICRO, nTimeFlush * MILLI / nBlocksTotal);
+    // Write the chain state to disk, if necessary.
+    if (!FlushStateToDisk(chainparams, state, FlushStateMode::IF_NEEDED))
+        return false;
+    int64_t nTime5 = GetTimeMicros(); nTimeChainState += nTime5 - nTime4;
+    LogPrint(BCLog::BENCH, "  - Writing chainstate: %.2fms [%.2fs (%.2fms/blk)]\n", (nTime5 - nTime4) * MILLI, nTimeChainState * MICRO, nTimeChainState * MILLI / nBlocksTotal);
+    // Remove conflicting transactions from the mempool.;
+    mempool.removeForBlock(blockConnecting.vtx, pindexNew->nHeight);
+    disconnectpool.removeForBlock(blockConnecting.vtx);
+    // Update chainActive & related variables.
+    chainActive.SetTip(pindexNew);
+    UpdateTip(pindexNew, chainparams);
+
+    int64_t nTime6 = GetTimeMicros(); nTimePostConnect += nTime6 - nTime5; nTimeTotal += nTime6 - nTime1;
+    LogPrint(BCLog::BENCH, "  - Connect postprocess: %.2fms [%.2fs (%.2fms/blk)]\n", (nTime6 - nTime5) * MILLI, nTimePostConnect * MICRO, nTimePostConnect * MILLI / nBlocksTotal);
+    LogPrint(BCLog::BENCH, "- Connect block: %.2fms [%.2fs (%.2fms/blk)]\n", (nTime6 - nTime1) * MILLI, nTimeTotal * MICRO, nTimeTotal * MILLI / nBlocksTotal);
+
+    connectTrace.BlockConnected(pindexNew, std::move(pthisBlock));
+    return true;
+}
+
+// rpc/blockchain.cpp 
+UniValue gettxout(const JSONRPCRequest& request)
+{
+    UniValue ret(UniValue::VOBJ);
+
+    uint256 hash(ParseHashV(request.params[0], "txid"));
+    int n = request.params[1].get_int();
+    COutPoint out(hash, n);
+    bool fMempool = true;
+    if (!request.params[2].isNull())
+        fMempool = request.params[2].get_bool();
+
+    Coin coin;
+    if (fMempool) {
+        LOCK(mempool.cs);
+        CCoinsViewMemPool view(pcoinsTip.get(), mempool); //@@@@@@@@@@@@@@@@@@@@@@@
+        if (!view.GetCoin(out, coin) || mempool.isSpent(out)) {
+            return NullUniValue;
+        }
+    } else {
+        if (!pcoinsTip->GetCoin(out, coin)) {
+            return NullUniValue;
+        }
+    }
+
+    const CBlockIndex* pindex = LookupBlockIndex(pcoinsTip->GetBestBlock());
+    ret.pushKV("bestblock", pindex->GetBlockHash().GetHex());
+    if (coin.nHeight == MEMPOOL_HEIGHT) {
+        ret.pushKV("confirmations", 0);
+    } else {
+        ret.pushKV("confirmations", (int64_t)(pindex->nHeight - coin.nHeight + 1));
+    }
+    ret.pushKV("value", ValueFromAmount(coin.out.nValue));
+    UniValue o(UniValue::VOBJ);
+    ScriptPubKeyToUniv(coin.out.scriptPubKey, o, true);
+    ret.pushKV("scriptPubKey", o);
+    ret.pushKV("coinbase", (bool)coin.fCoinBase);
+
+    return ret;
+}
+
+// rpc/rawtransaction.cpp
+static UniValue combinerawtransaction(const JSONRPCRequest& request)
+{
+    UniValue txs = request.params[0].get_array();
+    std::vector<CMutableTransaction> txVariants(txs.size());
+
+    for (unsigned int idx = 0; idx < txs.size(); idx++) {
+        if (!DecodeHexTx(txVariants[idx], txs[idx].get_str(), true)) {
+            throw JSONRPCError(RPC_DESERIALIZATION_ERROR, strprintf("TX decode failed for tx %d", idx));
+        }
+    }
+
+    if (txVariants.empty()) {
+        throw JSONRPCError(RPC_DESERIALIZATION_ERROR, "Missing transactions");
+    }
+
+    // mergedTx will end up with all the signatures; it
+    // starts as a clone of the rawtx:
+    CMutableTransaction mergedTx(txVariants[0]);
+
+    // Fetch previous transactions (inputs):
+    CCoinsView viewDummy;
+    CCoinsViewCache view(&viewDummy);
+    {
+        LOCK(cs_main);
+        LOCK(mempool.cs);
+        CCoinsViewCache &viewChain = *pcoinsTip; //@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+        CCoinsViewMemPool viewMempool(&viewChain, mempool);
+        view.SetBackend(viewMempool); // temporarily switch cache backend to db+mempool view
+
+        for (const CTxIn& txin : mergedTx.vin) {
+            view.AccessCoin(txin.prevout); // Load entries from viewChain into view; can fail.
+        }
+
+        view.SetBackend(viewDummy); // switch back to avoid locking mempool for too long
+    }
+
+    // Use CTransaction for the constant parts of the
+    // transaction to avoid rehashing.
+    const CTransaction txConst(mergedTx);
+    // Sign what we can:
+    for (unsigned int i = 0; i < mergedTx.vin.size(); i++) {
+        CTxIn& txin = mergedTx.vin[i];
+        const Coin& coin = view.AccessCoin(txin.prevout);
+        if (coin.IsSpent()) {
+            throw JSONRPCError(RPC_VERIFY_ERROR, "Input not found or already spent");
+        }
+        SignatureData sigdata;
+
+        // ... and merge in other signatures:
+        for (const CMutableTransaction& txv : txVariants) {
+            if (txv.vin.size() > i) {
+                sigdata.MergeSignatureData(DataFromTransaction(txv, i, coin.out));
+            }
+        }
+        ProduceSignature(DUMMY_SIGNING_PROVIDER, MutableTransactionSignatureCreator(&mergedTx, i, coin.out.nValue, 1), coin.out.scriptPubKey, sigdata);
+
+        UpdateInput(txin, sigdata);
+    }
+
+    return EncodeHexTx(mergedTx);
+}
+
+static UniValue sendrawtransaction(const JSONRPCRequest& request)
+{
+    std::promise<void> promise;
+
+    RPCTypeCheck(request.params, {UniValue::VSTR, UniValue::VBOOL});
+
+    // parse hex string from parameter
+    CMutableTransaction mtx;
+    if (!DecodeHexTx(mtx, request.params[0].get_str()))
+        throw JSONRPCError(RPC_DESERIALIZATION_ERROR, "TX decode failed");
+    CTransactionRef tx(MakeTransactionRef(std::move(mtx)));
+    const uint256& hashTx = tx->GetHash();
+
+    CAmount nMaxRawTxFee = maxTxFee;
+    if (!request.params[1].isNull() && request.params[1].get_bool())
+        nMaxRawTxFee = 0;
+
+    { // cs_main scope
+    LOCK(cs_main);
+    CCoinsViewCache &view = *pcoinsTip;
+    bool fHaveChain = false;
+    for (size_t o = 0; !fHaveChain && o < tx->vout.size(); o++) {
+      const Coin& existingCoin = view.AccessCoin(COutPoint(hashTx, o)); //@@@@@@@@@@@@@@@@@@@@@@@@@
+        fHaveChain = !existingCoin.IsSpent();
+    }
+    bool fHaveMempool = mempool.exists(hashTx);
+    if (!fHaveMempool && !fHaveChain) {
+        // push to local node and sync with wallets
+        CValidationState state;
+        bool fMissingInputs;
+        if (!AcceptToMemoryPool(mempool, state, std::move(tx), &fMissingInputs, //??????????????????????
+                                nullptr /* plTxnReplaced */, false /* bypass_limits */, nMaxRawTxFee)) {
+            if (state.IsInvalid()) {
+                throw JSONRPCError(RPC_TRANSACTION_REJECTED, FormatStateMessage(state));
+            } else {
+                if (fMissingInputs) {
+                    throw JSONRPCError(RPC_TRANSACTION_ERROR, "Missing inputs");
+                }
+                throw JSONRPCError(RPC_TRANSACTION_ERROR, FormatStateMessage(state));
+            }
+        } else {
+            // If wallet is enabled, ensure that the wallet has been made aware
+            // of the new transaction prior to returning. This prevents a race
+            // where a user might call sendrawtransaction with a transaction
+            // to/from their wallet, immediately call some wallet RPC, and get
+            // a stale result because callbacks have not yet been processed.
+	  CallFunctionInValidationInterfaceQueue([&promise] { //????????????????????????
+                promise.set_value();
+            });
+        }
+    } else if (fHaveChain) {
+        throw JSONRPCError(RPC_TRANSACTION_ALREADY_IN_CHAIN, "transaction already in block chain");
+    } else {
+        // Make sure we don't block forever if re-sending
+        // a transaction already in mempool.
+        promise.set_value();
+    }
+
+    } // cs_main
+
+    promise.get_future().wait();
+
+    if(!g_connman)
+        throw JSONRPCError(RPC_CLIENT_P2P_DISABLED, "Error: Peer-to-peer functionality missing or disabled");
+
+    CInv inv(MSG_TX, hashTx);
+    g_connman->ForEachNode([&inv](CNode* pnode)
+    {
+        pnode->PushInventory(inv);
+    });
+
+    return hashTx.GetHex();
+}
+
+// coins.cpp 
 void CCoinsViewCache::AddCoin(const COutPoint &outpoint, Coin&& coin, bool possible_overwrite) {
     assert(!coin.IsSpent());
     if (coin.out.scriptPubKey.IsUnspendable()) return;
@@ -1410,6 +1747,15 @@ void CCoinsViewCache::AddCoin(const COutPoint &outpoint, Coin&& coin, bool possi
     it->second.coin = std::move(coin);
     it->second.flags |= CCoinsCacheEntry::DIRTY | (fresh ? CCoinsCacheEntry::FRESH : 0);
     cachedCoinsUsage += it->second.coin.DynamicMemoryUsage();
+}
+
+bool CCoinsViewCache::GetCoin(const COutPoint &outpoint, Coin &coin) const {
+    CCoinsMap::const_iterator it = FetchCoin(outpoint);
+    if (it != cacheCoins.end()) {
+        coin = it->second.coin;
+        return !coin.IsSpent();
+    }
+    return false;
 }
 
 CCoinsMap::iterator CCoinsViewCache::FetchCoin(const COutPoint &outpoint) const {
@@ -1734,3 +2080,605 @@ template <typename Callable> void TraceThread(const char* name,  Callable func)
         throw;
     }
 }
+
+// consensus/tx_verify.cpp
+bool Consensus::CheckTxInputs(const CTransaction& tx, CValidationState& state, const CCoinsViewCache& inputs, int nSpendHeight, CAmount& txfee)
+{
+    // are the actual inputs available?
+    if (!inputs.HaveInputs(tx)) {
+        return state.DoS(100, false, REJECT_INVALID, "bad-txns-inputs-missingorspent", false,
+                         strprintf("%s: inputs missing/spent", __func__));
+    }
+
+    CAmount nValueIn = 0;
+    for (unsigned int i = 0; i < tx.vin.size(); ++i) {
+        const COutPoint &prevout = tx.vin[i].prevout;
+        const Coin& coin = inputs.AccessCoin(prevout);
+        assert(!coin.IsSpent());
+
+        // If prev is coinbase, check that it's matured
+        if (coin.IsCoinBase() && nSpendHeight - coin.nHeight < COINBASE_MATURITY) {
+            return state.Invalid(false,
+                REJECT_INVALID, "bad-txns-premature-spend-of-coinbase",
+                strprintf("tried to spend coinbase at depth %d", nSpendHeight - coin.nHeight));
+        }
+
+        // Check for negative or overflow input values
+        nValueIn += coin.out.nValue;
+        if (!MoneyRange(coin.out.nValue) || !MoneyRange(nValueIn)) {
+            return state.DoS(100, false, REJECT_INVALID, "bad-txns-inputvalues-outofrange");
+        }
+    }
+
+    const CAmount value_out = tx.GetValueOut();
+    if (nValueIn < value_out) {
+        return state.DoS(100, false, REJECT_INVALID, "bad-txns-in-belowout", false,
+            strprintf("value in (%s) < value out (%s)", FormatMoney(nValueIn), FormatMoney(value_out)));
+    }
+
+    // Tally transaction fees
+    const CAmount txfee_aux = nValueIn - value_out;
+    if (!MoneyRange(txfee_aux)) {
+        return state.DoS(100, false, REJECT_INVALID, "bad-txns-fee-outofrange");
+    }
+
+    txfee = txfee_aux;
+    return true;
+}
+
+/**
+ * Check transaction inputs to mitigate two
+ * potential denial-of-service attacks:
+ *
+ * 1. scriptSigs with extra data stuffed into them,
+ *    not consumed by scriptPubKey (or P2SH script)
+ * 2. P2SH scripts with a crazy number of expensive
+ *    CHECKSIG/CHECKMULTISIG operations
+ *
+ * Why bother? To avoid denial-of-service attacks; an attacker
+ * can submit a standard HASH... OP_EQUAL transaction,
+ * which will get accepted into blocks. The redemption
+ * script can be anything; an attacker could use a very
+ * expensive-to-check-upon-redemption script like:
+ *   DUP CHECKSIG DROP ... repeated 100 times... OP_1
+ */
+// policy/policy.cpp
+bool AreInputsStandard(const CTransaction& tx, const CCoinsViewCache& mapInputs)
+{
+    if (tx.IsCoinBase())
+        return true; // Coinbases don't use vin normally
+
+    for (unsigned int i = 0; i < tx.vin.size(); i++)
+    {
+        const CTxOut& prev = mapInputs.AccessCoin(tx.vin[i].prevout).out;
+
+        std::vector<std::vector<unsigned char> > vSolutions;
+        txnouttype whichType = Solver(prev.scriptPubKey, vSolutions);
+        if (whichType == TX_NONSTANDARD) {
+            return false;
+        } else if (whichType == TX_SCRIPTHASH) {
+            std::vector<std::vector<unsigned char> > stack;
+            // convert the scriptSig into a stack, so we can inspect the redeemScript
+            if (!EvalScript(stack, tx.vin[i].scriptSig, SCRIPT_VERIFY_NONE, BaseSignatureChecker(), SigVersion::BASE))
+                return false;
+            if (stack.empty())
+                return false;
+            CScript subscript(stack.back().begin(), stack.back().end());
+            if (subscript.GetSigOpCount(true) > MAX_P2SH_SIGOPS) {
+                return false;
+            }
+        }
+    }
+
+    return true;
+}
+
+int64_t GetTransactionSigOpCost(const CTransaction& tx, const CCoinsViewCache& inputs, int flags)
+{
+    int64_t nSigOps = GetLegacySigOpCount(tx) * WITNESS_SCALE_FACTOR;
+
+    if (tx.IsCoinBase())
+        return nSigOps;
+
+    if (flags & SCRIPT_VERIFY_P2SH) {
+        nSigOps += GetP2SHSigOpCount(tx, inputs) * WITNESS_SCALE_FACTOR;
+    }
+
+    for (unsigned int i = 0; i < tx.vin.size(); i++)
+    {
+        const Coin& coin = inputs.AccessCoin(tx.vin[i].prevout);
+        assert(!coin.IsSpent());
+        const CTxOut &prevout = coin.out;
+        nSigOps += CountWitnessSigOps(tx.vin[i].scriptSig, prevout.scriptPubKey, &tx.vin[i].scriptWitness, flags);
+    }
+    return nSigOps;
+}
+
+// script/script.cpp
+unsigned int CScript::GetSigOpCount(bool fAccurate) const
+{
+    unsigned int n = 0;
+    const_iterator pc = begin();
+    opcodetype lastOpcode = OP_INVALIDOPCODE;
+    while (pc < end())
+    {
+        opcodetype opcode;
+        if (!GetOp(pc, opcode))
+            break;
+        if (opcode == OP_CHECKSIG || opcode == OP_CHECKSIGVERIFY)
+            n++;
+        else if (opcode == OP_CHECKMULTISIG || opcode == OP_CHECKMULTISIGVERIFY)
+        {
+            if (fAccurate && lastOpcode >= OP_1 && lastOpcode <= OP_16)
+                n += DecodeOP_N(lastOpcode);
+            else
+                n += MAX_PUBKEYS_PER_MULTISIG;
+        }
+        lastOpcode = opcode;
+    }
+    return n;
+}
+
+// txmempool.cpp
+void CTxMemPool::PrioritiseTransaction(const uint256& hash, const CAmount& nFeeDelta)
+{
+    {
+        LOCK(cs);
+        CAmount &delta = mapDeltas[hash];
+        delta += nFeeDelta;
+        txiter it = mapTx.find(hash);
+        if (it != mapTx.end()) {
+            mapTx.modify(it, update_fee_delta(delta));
+            // Now update all ancestors' modified fees with descendants
+            setEntries setAncestors;
+            uint64_t nNoLimit = std::numeric_limits<uint64_t>::max();
+            std::string dummy;
+            CalculateMemPoolAncestors(*it, setAncestors, nNoLimit, nNoLimit, nNoLimit, nNoLimit, dummy, false);
+            for (txiter ancestorIt : setAncestors) {
+                mapTx.modify(ancestorIt, update_descendant_state(0, nFeeDelta, 0));
+            }
+            // Now update all descendants' modified fees with ancestors
+            setEntries setDescendants;
+            CalculateDescendants(it, setDescendants);
+            setDescendants.erase(it);
+            for (txiter descendantIt : setDescendants) {
+                mapTx.modify(descendantIt, update_ancestor_state(0, nFeeDelta, 0, 0));
+            }
+            ++nTransactionsUpdated;
+        }
+    }
+    LogPrintf("PrioritiseTransaction: %s feerate += %s\n", hash.ToString(), FormatMoney(nFeeDelta));
+}
+
+void CTxMemPool::ApplyDelta(const uint256 hash, CAmount &nFeeDelta) const
+{
+    LOCK(cs);
+    std::map<uint256, CAmount>::const_iterator pos = mapDeltas.find(hash);
+    if (pos == mapDeltas.end())
+        return;
+    const CAmount &delta = pos->second;
+    nFeeDelta += delta;
+}
+
+//-----------------------------------------------------------------------
+//-----------------------------------------------------------------------
+//-----------------------------------------------------------------------
+
+/** Describes a place in the block chain to another node such that if the
+ * other node doesn't have the same branch, it can find a recent common trunk.
+ * The further back it is, the further before the fork it may be.
+ */
+struct CBlockLocator
+{
+    std::vector<uint256> vHave;
+
+    CBlockLocator() {}
+
+    explicit CBlockLocator(const std::vector<uint256>& vHaveIn) : vHave(vHaveIn) {}
+
+    ADD_SERIALIZE_METHODS;
+
+    template <typename Stream, typename Operation>
+    inline void SerializationOp(Stream& s, Operation ser_action) {
+        int nVersion = s.GetVersion();
+        if (!(s.GetType() & SER_GETHASH))
+            READWRITE(nVersion);
+        READWRITE(vHave);
+    }
+
+    void SetNull()
+    {
+        vHave.clear();
+    }
+
+    bool IsNull() const
+    {
+        return vHave.empty();
+    }
+};
+
+CBlockLocator CChain::GetLocator(const CBlockIndex *pindex) const {
+    int nStep = 1;
+    std::vector<uint256> vHave;
+    vHave.reserve(32);
+
+    if (!pindex)
+        pindex = Tip();
+    while (pindex) {
+        vHave.push_back(pindex->GetBlockHash());
+        // Stop when we have added the genesis block.
+        if (pindex->nHeight == 0)
+            break;
+        // Exponentially larger steps back, plus the genesis block.
+        int nHeight = std::max(pindex->nHeight - nStep, 0);
+        if (Contains(pindex)) {
+            // Use O(1) CChain index if possible.
+            pindex = (*this)[nHeight];
+        } else {
+            // Otherwise, use O(log n) skiplist.
+            pindex = pindex->GetAncestor(nHeight);
+        }
+        if (vHave.size() > 10)
+            nStep *= 2;
+    }
+
+    return CBlockLocator(vHave);
+}
+
+bool BaseIndex::WriteBestBlock(const CBlockIndex* block_index)
+{
+    LOCK(cs_main);
+    if (!GetDB().WriteBestBlock(chainActive.GetLocator(block_index))) {
+        return error("%s: Failed to write locator to disk", __func__);
+    }
+    return true;
+}
+
+//-----------------------------------------------------------------------
+//-----------------------------------------------------------------------
+//-----------------------------------------------------------------------
+
+void CallFunctionInValidationInterfaceQueue(std::function<void ()> func) {
+    g_signals.m_internals->m_schedulerClient.AddToProcessQueue(std::move(func));
+}
+
+void SyncWithValidationInterfaceQueue() {
+    AssertLockNotHeld(cs_main);
+    // Block until the validation queue drains
+    std::promise<void> promise;
+    CallFunctionInValidationInterfaceQueue([&promise] {
+        promise.set_value();
+    });
+    promise.get_future().wait();
+}
+
+void CMainSignals::MempoolEntryRemoved(CTransactionRef ptx, MemPoolRemovalReason reason) {
+    if (reason != MemPoolRemovalReason::BLOCK && reason != MemPoolRemovalReason::CONFLICT) {
+        m_internals->m_schedulerClient.AddToProcessQueue([ptx, this] {
+            m_internals->TransactionRemovedFromMempool(ptx);
+        });
+    }
+}
+
+void CMainSignals::UpdatedBlockTip(const CBlockIndex *pindexNew, const CBlockIndex *pindexFork, bool fInitialDownload) {
+    // Dependencies exist that require UpdatedBlockTip events to be delivered in the order in which
+    // the chain actually updates. One way to ensure this is for the caller to invoke this signal
+    // in the same critical section where the chain is updated
+
+    m_internals->m_schedulerClient.AddToProcessQueue([pindexNew, pindexFork, fInitialDownload, this] {
+        m_internals->UpdatedBlockTip(pindexNew, pindexFork, fInitialDownload);
+    });
+}
+
+void CMainSignals::TransactionAddedToMempool(const CTransactionRef &ptx) {
+    m_internals->m_schedulerClient.AddToProcessQueue([ptx, this] {
+        m_internals->TransactionAddedToMempool(ptx);
+    });
+}
+
+void CMainSignals::BlockConnected(const std::shared_ptr<const CBlock> &pblock, const CBlockIndex *pindex, const std::shared_ptr<const std::vector<CTransactionRef>>& pvtxConflicted) {
+    m_internals->m_schedulerClient.AddToProcessQueue([pblock, pindex, pvtxConflicted, this] {
+        m_internals->BlockConnected(pblock, pindex, *pvtxConflicted);
+    });
+}
+
+void CMainSignals::BlockDisconnected(const std::shared_ptr<const CBlock> &pblock) {
+    m_internals->m_schedulerClient.AddToProcessQueue([pblock, this] {
+        m_internals->BlockDisconnected(pblock);
+    });
+}
+
+void CMainSignals::ChainStateFlushed(const CBlockLocator &locator) {
+    m_internals->m_schedulerClient.AddToProcessQueue([locator, this] {
+        m_internals->ChainStateFlushed(locator);
+    });
+}
+
+void CMainSignals::Broadcast(int64_t nBestBlockTime, CConnman* connman) {
+    m_internals->Broadcast(nBestBlockTime, connman);
+}
+
+void CMainSignals::BlockChecked(const CBlock& block, const CValidationState& state) {
+    m_internals->BlockChecked(block, state);
+}
+
+void CMainSignals::NewPoWValidBlock(const CBlockIndex *pindex, const std::shared_ptr<const CBlock> &block) {
+    m_internals->NewPoWValidBlock(pindex, block);
+}
+
+class CMainSignals {
+private:
+    std::unique_ptr<MainSignalsInstance> m_internals;
+
+    friend void ::RegisterValidationInterface(CValidationInterface*);
+    friend void ::UnregisterValidationInterface(CValidationInterface*);
+    friend void ::UnregisterAllValidationInterfaces();
+    friend void ::CallFunctionInValidationInterfaceQueue(std::function<void ()> func);
+
+    void MempoolEntryRemoved(CTransactionRef tx, MemPoolRemovalReason reason);
+
+public:
+    /** Register a CScheduler to give callbacks which should run in the background (may only be called once) */
+    void RegisterBackgroundSignalScheduler(CScheduler& scheduler);
+    /** Unregister a CScheduler to give callbacks which should run in the background - these callbacks will now be dropped! */
+    void UnregisterBackgroundSignalScheduler();
+    /** Call any remaining callbacks on the calling thread */
+    void FlushBackgroundCallbacks();
+
+    size_t CallbacksPending();
+
+    /** Register with mempool to call TransactionRemovedFromMempool callbacks */
+    void RegisterWithMempoolSignals(CTxMemPool& pool);
+    /** Unregister with mempool */
+    void UnregisterWithMempoolSignals(CTxMemPool& pool);
+
+    void UpdatedBlockTip(const CBlockIndex *, const CBlockIndex *, bool fInitialDownload);
+    void TransactionAddedToMempool(const CTransactionRef &);
+    void BlockConnected(const std::shared_ptr<const CBlock> &, const CBlockIndex *pindex, const std::shared_ptr<const std::vector<CTransactionRef>> &);
+    void BlockDisconnected(const std::shared_ptr<const CBlock> &);
+    void ChainStateFlushed(const CBlockLocator &);
+    void Broadcast(int64_t nBestBlockTime, CConnman* connman);
+    void BlockChecked(const CBlock&, const CValidationState&);
+    void NewPoWValidBlock(const CBlockIndex *, const std::shared_ptr<const CBlock>&);
+};
+
+struct MainSignalsInstance {
+    boost::signals2::signal<void (const CBlockIndex *, const CBlockIndex *, bool fInitialDownload)> UpdatedBlockTip;
+    boost::signals2::signal<void (const CTransactionRef &)> TransactionAddedToMempool;
+    boost::signals2::signal<void (const std::shared_ptr<const CBlock> &, const CBlockIndex *pindex, const std::vector<CTransactionRef>&)> BlockConnected;
+    boost::signals2::signal<void (const std::shared_ptr<const CBlock> &)> BlockDisconnected;
+    boost::signals2::signal<void (const CTransactionRef &)> TransactionRemovedFromMempool;
+    boost::signals2::signal<void (const CBlockLocator &)> ChainStateFlushed;
+    boost::signals2::signal<void (int64_t nBestBlockTime, CConnman* connman)> Broadcast;
+    boost::signals2::signal<void (const CBlock&, const CValidationState&)> BlockChecked;
+    boost::signals2::signal<void (const CBlockIndex *, const std::shared_ptr<const CBlock>&)> NewPoWValidBlock;
+
+    // We are not allowed to assume the scheduler only runs in one thread,
+    // but must ensure all callbacks happen in-order, so we end up creating
+    // our own queue here :(
+    SingleThreadedSchedulerClient m_schedulerClient; //@@@@@@@@@@@@@@@@@@@@@@@@@@
+    std::unordered_map<CValidationInterface*, ValidationInterfaceConnections> m_connMainSignals;
+
+    explicit MainSignalsInstance(CScheduler *pscheduler) : m_schedulerClient(pscheduler) {}
+};
+
+/**
+ * Class used by CScheduler clients which may schedule multiple jobs
+ * which are required to be run serially. Jobs may not be run on the
+ * same thread, but no two jobs will be executed
+ * at the same time and memory will be release-acquire consistent
+ * (the scheduler will internally do an acquire before invoking a callback
+ * as well as a release at the end). In practice this means that a callback
+ * B() will be able to observe all of the effects of callback A() which executed
+ * before it.
+ */
+class SingleThreadedSchedulerClient {
+private:
+    CScheduler *m_pscheduler;
+
+    CCriticalSection m_cs_callbacks_pending;
+    std::list<std::function<void ()>> m_callbacks_pending GUARDED_BY(m_cs_callbacks_pending);
+    bool m_are_callbacks_running GUARDED_BY(m_cs_callbacks_pending) = false;
+
+    void MaybeScheduleProcessQueue();
+    void ProcessQueue();
+
+public:
+    explicit SingleThreadedSchedulerClient(CScheduler *pschedulerIn) : m_pscheduler(pschedulerIn) {}
+
+    /**
+     * Add a callback to be executed. Callbacks are executed serially
+     * and memory is release-acquire consistent between callback executions.
+     * Practically, this means that callbacks can behave as if they are executed
+     * in order by a single thread.
+     */
+    void AddToProcessQueue(std::function<void ()> func);
+
+    // Processes all remaining queue members on the calling thread, blocking until queue is empty
+    // Must be called after the CScheduler has no remaining processing threads!
+    void EmptyQueue();
+
+    size_t CallbacksPending();
+};
+
+void SingleThreadedSchedulerClient::AddToProcessQueue(std::function<void ()> func) {
+    assert(m_pscheduler);
+
+    {
+        LOCK(m_cs_callbacks_pending);
+        m_callbacks_pending.emplace_back(std::move(func));
+    }
+    MaybeScheduleProcessQueue();
+}
+
+void SingleThreadedSchedulerClient::MaybeScheduleProcessQueue() {
+    {
+        LOCK(m_cs_callbacks_pending);
+        // Try to avoid scheduling too many copies here, but if we
+        // accidentally have two ProcessQueue's scheduled at once its
+        // not a big deal.
+        if (m_are_callbacks_running) return;
+        if (m_callbacks_pending.empty()) return;
+    }
+    m_pscheduler->schedule(std::bind(&SingleThreadedSchedulerClient::ProcessQueue, this));
+}
+
+void SingleThreadedSchedulerClient::ProcessQueue() {
+    std::function<void ()> callback;
+    {
+        LOCK(m_cs_callbacks_pending);
+        if (m_are_callbacks_running) return;
+        if (m_callbacks_pending.empty()) return;
+        m_are_callbacks_running = true;
+
+        callback = std::move(m_callbacks_pending.front());
+        m_callbacks_pending.pop_front();
+    }
+
+    // RAII the setting of fCallbacksRunning and calling MaybeScheduleProcessQueue
+    // to ensure both happen safely even if callback() throws.
+    struct RAIICallbacksRunning {
+        SingleThreadedSchedulerClient* instance;
+        explicit RAIICallbacksRunning(SingleThreadedSchedulerClient* _instance) : instance(_instance) {}
+        ~RAIICallbacksRunning() {
+            {
+                LOCK(instance->m_cs_callbacks_pending);
+                instance->m_are_callbacks_running = false;
+            }
+            instance->MaybeScheduleProcessQueue();
+        }
+    } raiicallbacksrunning(this);
+
+    callback();
+}
+
+void CScheduler::schedule(CScheduler::Function f, boost::chrono::system_clock::time_point t)
+{
+    {
+        boost::unique_lock<boost::mutex> lock(newTaskMutex);
+        taskQueue.insert(std::make_pair(t, f));
+    }
+    newTaskScheduled.notify_one();
+}
+
+bool AppInitMain(InitInterfaces& interfaces)
+{
+    CScheduler::Function serviceLoop = std::bind(&CScheduler::serviceQueue, &scheduler);
+    threadGroup.create_thread(std::bind(&TraceThread<CScheduler::Function>, "scheduler", serviceLoop));
+}
+
+void CScheduler::serviceQueue()
+{
+    boost::unique_lock<boost::mutex> lock(newTaskMutex);
+    ++nThreadsServicingQueue;
+
+    // newTaskMutex is locked throughout this loop EXCEPT
+    // when the thread is waiting or when the user's function
+    // is called.
+    while (!shouldStop()) {
+        try {
+            if (!shouldStop() && taskQueue.empty()) {
+                reverse_lock<boost::unique_lock<boost::mutex> > rlock(lock);
+                // Use this chance to get a tiny bit more entropy
+                RandAddSeedSleep();
+            }
+            while (!shouldStop() && taskQueue.empty()) {
+                // Wait until there is something to do.
+                newTaskScheduled.wait(lock);
+            }
+
+            // Wait until either there is a new task, or until
+            // the time of the first item on the queue:
+
+// wait_until needs boost 1.50 or later; older versions have timed_wait:
+#if BOOST_VERSION < 105000
+            while (!shouldStop() && !taskQueue.empty() &&
+                   newTaskScheduled.timed_wait(lock, toPosixTime(taskQueue.begin()->first))) {
+                // Keep waiting until timeout
+            }
+#else
+            // Some boost versions have a conflicting overload of wait_until that returns void.
+            // Explicitly use a template here to avoid hitting that overload.
+            while (!shouldStop() && !taskQueue.empty()) {
+                boost::chrono::system_clock::time_point timeToWaitFor = taskQueue.begin()->first;
+                if (newTaskScheduled.wait_until<>(lock, timeToWaitFor) == boost::cv_status::timeout)
+                    break; // Exit loop after timeout, it means we reached the time of the event
+            }
+#endif
+            // If there are multiple threads, the queue can empty while we're waiting (another
+            // thread may service the task we were waiting on).
+            if (shouldStop() || taskQueue.empty())
+                continue;
+
+            Function f = taskQueue.begin()->second;
+            taskQueue.erase(taskQueue.begin());
+
+            {
+                // Unlock before calling f, so it can reschedule itself or another task
+                // without deadlocking:
+                reverse_lock<boost::unique_lock<boost::mutex> > rlock(lock);
+                f();
+            }
+        } catch (...) {
+            --nThreadsServicingQueue;
+            throw;
+        }
+    }
+    --nThreadsServicingQueue;
+    newTaskScheduled.notify_one();
+}
+
+class CScheduler
+{
+public:
+    CScheduler();
+    ~CScheduler();
+
+    typedef std::function<void()> Function;
+
+    // Call func at/after time t
+    void schedule(Function f, boost::chrono::system_clock::time_point t=boost::chrono::system_clock::now());
+
+    // Convenience method: call f once deltaSeconds from now
+    void scheduleFromNow(Function f, int64_t deltaMilliSeconds);
+
+    // Another convenience method: call f approximately
+    // every deltaSeconds forever, starting deltaSeconds from now.
+    // To be more precise: every time f is finished, it
+    // is rescheduled to run deltaSeconds later. If you
+    // need more accurate scheduling, don't use this method.
+    void scheduleEvery(Function f, int64_t deltaMilliSeconds);
+
+    // To keep things as simple as possible, there is no unschedule.
+
+    // Services the queue 'forever'. Should be run in a thread,
+    // and interrupted using boost::interrupt_thread
+    void serviceQueue();
+
+    // Tell any threads running serviceQueue to stop as soon as they're
+    // done servicing whatever task they're currently servicing (drain=false)
+    // or when there is no work left to be done (drain=true)
+    void stop(bool drain=false);
+
+    // Returns number of tasks waiting to be serviced,
+    // and first and last task times
+    size_t getQueueInfo(boost::chrono::system_clock::time_point &first,
+                        boost::chrono::system_clock::time_point &last) const;
+
+    // Returns true if there are threads actively running in serviceQueue()
+    bool AreThreadsServicingQueue() const;
+
+private:
+    std::multimap<boost::chrono::system_clock::time_point, Function> taskQueue;
+    boost::condition_variable newTaskScheduled;
+    mutable boost::mutex newTaskMutex;
+    int nThreadsServicingQueue;
+    bool stopRequested;
+    bool stopWhenEmpty;
+    bool shouldStop() const { return stopRequested || (stopWhenEmpty && taskQueue.empty()); }
+};
+
+//-----------------------------------------------------------------------
+//-----------------------------------------------------------------------
+//-----------------------------------------------------------------------
+
