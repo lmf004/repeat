@@ -38,7 +38,7 @@ enum {
   FATAL,
 };
 
-int g_log_level = DEBUG;
+int g_log_level = INFO;
 
 std::string green_text(const char* text) {
   char buf[256];
@@ -144,20 +144,33 @@ namespace exchange {
   {
     //static constexpr double initMarketRate = 0.00000005;
     static constexpr double initMarketRate = 0.5;
-    static constexpr uint64_t minExchangeNum = 10;
+    static constexpr uint64_t minExchangeNum = 1;
     static constexpr uint64_t maxExchangeNum = 10000;
   };
 
 
   struct Order
   {
-    Order(){}
-    Order(int from, int to , int type, double rate, int num, int minNum, std::string user)
-      : _from(from), _to(to), _type(type), _rate(rate), _num(num), _minNum(minNum), _user(user)
+    static uint32_t gcnt;
+    
+    Order(){ gcnt++; }
+    Order(int idx, int from, int to , int type, double rate, int num, int minNum, std::string user)
+      : _idx(idx), _from(from), _to(to), _type(type), _rate(rate), _num(num), _minNum(minNum), _user(user)
     {
       _timeStamp = time(NULL);
-      _deadline = _timeStamp + 60;
+      _deadline = _timeStamp + 3600;
+      gcnt++;
     }
+    ~Order(){
+      if(!_matched && !_timeout) {
+	LOG(ERROR, "order is deleted wrongly");
+	printf("this: %p\n", this);
+	dump();
+      }
+      gcnt--;
+    }
+
+    int _idx;
     int _from;
     int _to;
     int _type;
@@ -188,14 +201,24 @@ namespace exchange {
 	return 7;
       return 0;
     }
+
+    std::string string()
+    {
+      char text[512];
+      sprintf(text, "{idx:%d, from:%d,to:%d,type:%d,rate:%.8f,num:%lu,minNum:%lu,user:%s,timeStamp:%u,dealine:%u,matched:%d,timeout:%d}"
+	      , _idx, _from, _to, _type, _rate, _num, _minNum, _user.c_str(), _timeStamp, _deadline, _matched, _timeout);
+      return std::string(text);
+    }
     
     void dump()
     {
-      printf("order-> from:%d, to:%d, type:%d, rate:%.8f, num:%lu, minNum:%lu, user:%s, timeStamp:%u, dealine:%u, matched:%d, timeout:%d\n"
-	     , _from, _to, _type, _rate, _num, _minNum, _user.c_str(), _timeStamp, _deadline, _matched, _timeout);
+      printf("order -> idx:%d, from:%d, to:%d, type:%d, rate:%.8f, num:%lu, minNum:%lu, user:%s, timeStamp:%u, dealine:%u, matched:%d, timeout:%d, gcnt:%u\n"
+	     , _idx, _from, _to, _type, _rate, _num, _minNum, _user.c_str(), _timeStamp, _deadline, _matched, _timeout, gcnt);
     }
   };
 
+  uint32_t Order::gcnt = 0;
+  
   struct comparebynum
   {
     bool operator()(const std::shared_ptr<Order>& lhs, const std::shared_ptr<Order>& rhs) const
@@ -227,6 +250,17 @@ namespace exchange {
       return lhs->_deadline < rhs->_deadline;
     }
   };
+
+  template<class Container, class Element>
+  void remove_if_ex(Container & v, std::function<bool(Element)> func)
+  {
+    for(auto it = v.begin(); it != v.end();) {
+      if(func(*it))
+	it = v.erase(it);
+      else
+	it++;
+    }
+  }
   
   typedef std::shared_ptr<Order> OrderPtr;
   typedef std::multiset<OrderPtr, comparebynum>  OrderNumSet;
@@ -236,13 +270,15 @@ namespace exchange {
   struct Transaction
   {
     Transaction(OrderPtr d1, OrderPtr d2, double rate, uint64_t num)
-      : _order1(d1), _order2(d2), _rate(rate), _num(num)
+      : _rate(rate), _num(num)
     {
       _timeStamp = time(NULL);
+      _order1 = d1->string();
+      _order2 = d2->string();
     }
   
-    OrderPtr _order1;
-    OrderPtr _order2;
+    std::string _order1;
+    std::string _order2;
     double _rate;
     uint64_t _num;
     uint32_t _timeStamp;
@@ -251,9 +287,7 @@ namespace exchange {
     void dump()
     {
       printf("tx-> \n");
-      _order1->dump();
-      _order2->dump();
-      printf("rate:%.8f, num:%lu, timeStamp:%u status:%d\n", _rate, _num, _timeStamp, _status);
+      printf("%s\n%s\nrate:%.8f, num:%lu, timeStamp:%u status:%d\n", _order1.c_str(), _order2.c_str(), _rate, _num, _timeStamp, _status);
     }
   };
 
@@ -286,13 +320,27 @@ namespace exchange {
       return -1;
     }
 
-    void remove_order(OrderPtr order)
+    void remove_cached_invalid_order()
     {
-      // if(order->_type == ORDER_TYPE_DELEGATE_BY_MARKET_PRICE) {
-      // 	if(_marketPriceOrderQueue.front() == order)
-      // 	  _marketPriceOrderQueue.pop();
-      // 	_marketPriceOrderSetByNum;
-      // }
+      std::function<bool(OrderPtr)> func =
+	[](OrderPtr order){ return order->_matched || order->_timeout; };
+      
+      remove_if_ex(_marketPriceOrderSetByNum, func);
+      
+      for(auto it = _limitPriceOrderMapByNum.begin(); it != _limitPriceOrderMapByNum.end(); ++it)
+	remove_if_ex(*(it->second), func);
+
+      remove_if_ex(_retry4minNumQueue, func);
+    }
+
+    void dump()
+    {
+      // printf("OrderBook -> isSeller:%d, marketPriceOrderQueue:%lu, marketPriceOrderSetByNum:%lu, limitPriceOrderSetByRate:%lu retry4minNumQueue:%lu\n",
+      // 	     _isSeller, _marketPriceOrderQueue.size(), _marketPriceOrderSetByNum.size(), _limitPriceOrderSetByRate.size(), _retry4minNumQueue.size());
+      // printf("---------001\n");
+      // for(auto a : _limitPriceOrderSetByRate)
+      // 	a->dump();
+      // printf("---------002\n");
     }
     
     bool _isSeller;
@@ -303,7 +351,7 @@ namespace exchange {
     OrderRateSet _limitPriceOrderSetByRate;
     std::map<uint64_t, std::shared_ptr<OrderRateSet>> _limitPriceOrderMapByNum;
 
-    std::queue<OrderPtr> _retry4minNumQueue;
+    std::list<OrderPtr> _retry4minNumQueue;
   };
 
   OrderNumSet::iterator num_set_find_nearest(uint64_t num, OrderNumSet & set)
@@ -313,14 +361,16 @@ namespace exchange {
     if(set.size() == 1)
       return set.begin();
 
-    auto key = std::make_shared<Order>();
+    //auto key = std::make_shared<Order>();
+    static std::shared_ptr<Order> key(new Order);
     key->_num = num;
     auto pos = set.lower_bound(key);
-    if((*pos)->_num == num)
+    if(pos == set.begin())
       return pos;
-    
     if(pos == set.end()) 
       return --pos;
+    if((*pos)->_num == num)
+      return pos;
     
     auto posleft = --pos;
     auto numleft = (*posleft)->_num;
@@ -340,11 +390,12 @@ namespace exchange {
       return map.begin();
     
     auto pos = map.lower_bound(num);
-    if(pos->first == num)
+    if(pos == map.begin()) 
       return pos;
-    
     if(pos == map.end()) 
       return --pos;
+    if(pos->first == num)
+      return pos;
     
     auto posleft = --pos;
     auto invl = (posleft->first > num) ? (posleft->first - num) : (num - posleft->first) ;
@@ -376,7 +427,7 @@ namespace exchange {
     void run(volatile bool* alive)
     {
       LOG(INFO, "MatchEngine::run start!\n");
-      
+
       while(*alive) {
 
 	auto now = uint32_t(time(NULL));
@@ -384,12 +435,18 @@ namespace exchange {
 	for(;;) {
 	  if(_timeoutQueue.empty())
 	    break;
-	  auto order = _timeoutQueue.top();
+	  auto pos = _timeoutQueue.begin();
+	  auto order = *pos;
+	  if(order->_matched) {
+	    _timeoutQueue.erase(pos);
+	    continue;
+	  }
 	  if(order->_deadline >= now)
 	    break;
 	  order->_timeout = true;
-	  _timeoutQueue.pop();
-	  LOG(INFO, "order timeout!");
+	  _timeoutQueue.erase(pos);
+	  if(!order->_matched)
+	    LOG(INFO, "order timeout!");
 	  order->dump();
 	}
 	
@@ -408,8 +465,32 @@ namespace exchange {
 	  ret = do_match(_buyerOrderBook, _sellerOrderBook);
 	
 	if(ret != 0) {
-	  LOG(INFO, "do_match failed with %d", ret);
-	  usleep(1000*1000);
+	  LOG(DEBUG, "do_match return with %d", ret);
+
+	  static uint32_t last = 0;
+	  if(now % 8 == 0 && now != last) {
+	    
+	    dot(".");
+	    
+	    _sellerOrderBook.remove_cached_invalid_order();
+	    _buyerOrderBook.remove_cached_invalid_order();
+	    
+	    std::function<bool(OrderPtr)> func = [](OrderPtr order){ return order->_matched; };
+	    remove_if_ex(_timeoutQueue, func);
+
+	    // _sellerOrderBook.dump();
+	    // _buyerOrderBook.dump();
+	    // printf("timeoutQueue:%lu\n", _timeoutQueue.size());
+
+	    auto a = _buyerOrderBook._marketPriceOrderQueue.size()+_buyerOrderBook._limitPriceOrderSetByRate.size()+_buyerOrderBook._retry4minNumQueue.size();
+	    auto b = _sellerOrderBook._marketPriceOrderQueue.size()+_sellerOrderBook._limitPriceOrderSetByRate.size()+_sellerOrderBook._retry4minNumQueue.size();
+	    
+	    if(Order::gcnt > 0)
+	      LOG(INFO, "order gcnt: %u, buyers:%lu, sellers:%lu", Order::gcnt, a, b);
+	    last = now;
+	  }
+
+	  //usleep(1*1000);
 	}
       }
       
@@ -441,7 +522,7 @@ namespace exchange {
 	order->dump();
 	return ret;
       }
-      _timeoutQueue.push(order);
+      _timeoutQueue.insert(order);
       if(is_seller(order->_from, order->_to))
 	return _sellerOrderBook.insert(order);
       else
@@ -471,6 +552,11 @@ namespace exchange {
 
     }
 
+    bool is_order_alive(OrderPtr a)
+    {
+      return a->_matched == false && a->_timeout == false;
+    }
+    
     bool is_order_rate_match(OrderPtr a, OrderPtr b)
     {
       auto sellerOrder = a->_to == TOKEN_BTC ? a : b;
@@ -483,7 +569,18 @@ namespace exchange {
       
       return buyerOrder->_rate >= sellerOrder->_rate;
     }
+
+    bool is_order_mininal_num_match(OrderPtr a, OrderPtr b)
+    {
+      auto num = std::min(a->_num, b->_num);
+      return a->_minNum <= num && b->_minNum <= num;
+    }
     
+    bool is_order_match(OrderPtr a, OrderPtr b)
+    {
+      return is_order_rate_match(a, b) && is_order_mininal_num_match(a, b);
+    }
+      
     bool check_order_minimal_num(OrderPtr a, OrderPtr b)
     {
       auto sellerOrder = a->_to == TOKEN_BTC ? a : b;
@@ -493,11 +590,11 @@ namespace exchange {
       auto num = std::min(sellerOrder->_num, buyerOrder->_num);
       
       if(sellerOrder->_minNum > num) {
-	_sellerOrderBook._retry4minNumQueue.push(sellerOrder);
+	_sellerOrderBook._retry4minNumQueue.push_back(sellerOrder);
 	ret = false;
       }
       if(buyerOrder->_minNum > num) {
-	_buyerOrderBook._retry4minNumQueue.push(buyerOrder);
+	_buyerOrderBook._retry4minNumQueue.push_back(buyerOrder);
 	ret = false;
       }
       
@@ -572,17 +669,18 @@ namespace exchange {
 	rate = buyerOrder->_rate;
       
       update_market_rate(rate);
-      
+
+      sellerOrder->_matched = true;
+      buyerOrder->_matched = true;
+
       auto ptx = std::make_shared<Transaction>(sellerOrder, buyerOrder, rate, std::min(sellerOrder->_num, buyerOrder->_num));
       _qout->push(ptx);
       
-      sellerOrder->_matched = true;
-      buyerOrder->_matched = true;
     }
 
     int handle_orders(OrderPtr a, OrderPtr b, std::function<void()> erasea, std::function<void()> eraseb) {
 
-      LOG(INFO, "handle_orders start...");
+      LOG(DEBUG, "handle_orders start...");
       
       if(check_order_timeout(a)) {
 	erasea();
@@ -601,17 +699,24 @@ namespace exchange {
 	eraseb();
 	return 14;
       }
+
+      if(!is_order_rate_match(a, b)){
+	LOG(ERROR, "handle_orders is_order_rate_match failed");
+	erasea();
+	eraseb();
+	return 15;
+      }
       
       check_order_minimal_num(a, b);
       
       auto num = std::min(a->_num, b->_num);
       if(!check_order_minimal_num(a, num)){
 	erasea();
-	return 15;
+	return 16;
       }
       if(!check_order_minimal_num(b, num)) {
 	eraseb();
-	return 16;
+	return 17;
       }
 	
       match_handler(a, b);
@@ -619,31 +724,54 @@ namespace exchange {
       erasea();
       eraseb();
 
-      LOG(INFO, "handle_orders success...");
+      static int i = 0;
+      LOG(INFO, "handle_orders success... %d", i++);
       
       return 0;
     };
-      
+
     template<class BOOK1, class BOOK2>
     int do_match(BOOK1 & book1, BOOK2 & book2)
     {
-      dot(".");
-      
+      int ret = -1;
       OrderPtr order;
-
       std::function<void()> order_erase;
       
       if(!book1._marketPriceOrderQueue.empty()) {
 	order = book1._marketPriceOrderQueue.front();
 	order_erase = [&]{ book1._marketPriceOrderQueue.pop(); };
-      } else if(!book1._limitPriceOrderSetByRate.empty()) {
-	auto pos = book1._limitPriceOrderSetByRate.begin();
-	order = *pos;
-	order_erase = [pos, &book1]{ book1._limitPriceOrderSetByRate.erase(pos); }; 
-      } else {
-	return 1;
+	ret = do_one_match(book1, book2, order, order_erase);
+	if(0 == ret) return 0;
       }
 
+      if(!book1._limitPriceOrderSetByRate.empty()) {
+      	auto pos = book1._limitPriceOrderSetByRate.begin();
+      	order = *pos;
+      	//order_erase = [pos, &book1]{ book1._limitPriceOrderSetByRate.erase(pos); };
+	order_erase = [&]{ book1._limitPriceOrderSetByRate.erase(pos); };
+      	ret = do_one_match(book1, book2, order, order_erase);
+      	if(0 == ret) return 0;
+      }
+
+      if(!book1._retry4minNumQueue.empty()) {
+      	bool poped = false;
+      	order = book1._retry4minNumQueue.front();
+      	order_erase = [&]{ book1._retry4minNumQueue.pop_front(); poped = true; };
+      	ret = do_one_match(book1, book2, order, order_erase);
+      	if(0 == ret) return 0;
+      	if(is_order_alive(order) && false == poped) {
+      	  book1._retry4minNumQueue.pop_front();
+      	  book1._retry4minNumQueue.push_back(order);
+      	}
+      }
+
+      usleep(1*1000);
+      return ret;
+    }
+    
+    template<class BOOK1, class BOOK2>
+    int do_one_match(BOOK1 & book1, BOOK2 & book2, OrderPtr order, std::function<void()> order_erase)
+    {
       LOG(DEBUG, "do_match @ 1");
 
       if(check_order_timeout(order)) {
@@ -661,7 +789,7 @@ namespace exchange {
       {
 	auto end = book2._marketPriceOrderSetByNum.end();
 	auto pos = book2._marketPriceOrderSetByNum.find(order);
-	if(pos != end)  
+	if(pos != end && is_order_rate_match(order, *pos))  
 	  return handle_orders(order, *pos, order_erase, [&]{ book2._marketPriceOrderSetByNum.erase(pos); });
       }
 
@@ -673,7 +801,7 @@ namespace exchange {
 
 	if(pos != end) {
 	  auto pos1 = find_valid_order_by_rate(order->_rate, pos->second); 
-	  if(pos1 != pos->second->end()) 
+	  if(pos1 != pos->second->end() && is_order_rate_match(order, *pos1)) 
 	    return handle_orders(order, *pos1, order_erase, [&]{ pos->second->erase(pos1); });
 	}
       }
@@ -684,7 +812,7 @@ namespace exchange {
 	auto end = book2._marketPriceOrderSetByNum.end();
 	auto pos = num_set_find_nearest(order->_num, book2._marketPriceOrderSetByNum); 
 					     
-	if(pos != end)  
+	if(pos != end && is_order_rate_match(order, *pos))  
 	  return handle_orders(order, *pos, order_erase, [&]{ book2._marketPriceOrderSetByNum.erase(pos); });
       }
 
@@ -696,7 +824,7 @@ namespace exchange {
 	
 	if(pos != end) {
 	  auto pos1 = find_valid_order_by_rate(order->_rate, pos->second); 
-	  if(pos1 != pos->second->end()) 
+	  if(pos1 != pos->second->end() && is_order_rate_match(order, *pos1)) 
 	    return handle_orders(order, *pos1, order_erase, [&]{ pos->second->erase(pos1); });
 	}
       }
@@ -707,44 +835,22 @@ namespace exchange {
 	auto end = book2._limitPriceOrderSetByRate.end();
 	auto pos = book2._limitPriceOrderSetByRate.begin();
 
-	if(pos != end) {
-	  if(is_order_rate_match(order, *pos)) 
-	    return handle_orders(order, *pos, order_erase, [&]{ book2._limitPriceOrderSetByRate.erase(pos); });
+	if(pos != end && is_order_rate_match(order, *pos)) {
+	  return handle_orders(order, *pos, order_erase, [&]{ book2._limitPriceOrderSetByRate.erase(pos); });
 	}
       }
 
       LOG(DEBUG, "do_match @ 7");
-      
-      if(order->_type == ORDER_TYPE_DELEGATE_BY_MARKET_PRICE) {
-	if(!book1._limitPriceOrderSetByRate.empty()) {
-	  auto pos = book1._limitPriceOrderSetByRate.begin();
-	  order = *pos;
-	  order_erase = [pos, &book1]{ book1._limitPriceOrderSetByRate.erase(pos); };
-	  {
-	    auto end = book2._limitPriceOrderSetByRate.end();
-	    auto pos = book2._limitPriceOrderSetByRate.begin();
-	    if(pos != end) {
-	      if(is_order_rate_match(order, *pos)) 
-		return handle_orders(order, *pos, order_erase, [&]{ book2._limitPriceOrderSetByRate.erase(pos); });
-	    }
-	  }
-	} 
-      }
 
+      for(auto it=book2._retry4minNumQueue.begin(); it != book2._retry4minNumQueue.end(); ++it) {
+      	auto order2 = *it;
+      	if(!is_order_match(order, order2))
+      	  continue;
+      	return handle_orders(order, order2, order_erase, [&]{ book2._retry4minNumQueue.erase(it); });
+      }
+      
       LOG(DEBUG, "do_match @ 8");
-      
-      if(!book2._retry4minNumQueue.empty()) {
-	auto order2 = book2._retry4minNumQueue.front();
-	if(is_order_rate_match(order, order2))
-	  return handle_orders(order, order2, order_erase, [&]{ book2._retry4minNumQueue.pop(); });
-	else {
-	  book2._retry4minNumQueue.pop();
-	  book2._retry4minNumQueue.push(order2);
-	}
-      }
 
-      LOG(DEBUG, "do_match @ 9");
-      
       return 4;
     }
 
@@ -757,7 +863,7 @@ namespace exchange {
     OrderBook<OrderRateSet1> _sellerOrderBook{true};
     OrderBook<OrderRateSet2> _buyerOrderBook{false};
 
-    std::priority_queue<OrderPtr, std::vector<OrderPtr>, comparebydeadline> _timeoutQueue;
+    std::multiset<OrderPtr, comparebydeadline> _timeoutQueue;
   };
 
 } // namespace exchange
@@ -772,40 +878,65 @@ int main()
   
   engine.set_queues(&qorder, &qtx);
 
+  bool done = false;
+  
   std::thread orderGenerator([&]{
       // from, to, type, rate, num, minNum, user, timeStamp
 
-      sleep(1);
+      std::vector<double> v;
+      for(int i=1; i<100; ++i)
+	v.push_back(0.001*i);
+      std::random_shuffle(v.begin(),v.end());
 
-      printf("\nmarket rate:  %.8f\n", engine.market_rate());
-      qorder.push(std::make_shared<exchange::Order>(0, 1, 1, 0.66, 10, 0, "alice3"));
-      qorder.push(std::make_shared<exchange::Order>(1, 0, 1, 0.44, 20, 0, "bob3"));
-      
-      sleep(30);
-      
-      printf("\nmarket rate:  %.8f\n", engine.market_rate());
-      qorder.push(std::make_shared<exchange::Order>(0, 1, 1, 0.66, 30, 0, "alice4"));
-      qorder.push(std::make_shared<exchange::Order>(1, 0, 1, 0.65, 20, 0, "bob4"));
-      
-      sleep(1);
+      std::vector<int> v1;
+      for(int i=1; i<500; ++i)
+	v1.push_back(i%100);
+      std::random_shuffle(v1.begin(),v1.end());
 
-      printf("\nmarket rate:  %.8f\n", engine.market_rate());
-      qorder.push(std::make_shared<exchange::Order>(0, 1, 1, 0.36, 30, 0, "alice5"));
-      qorder.push(std::make_shared<exchange::Order>(1, 0, 1, 0.35, 30, 0, "bob5"));
-
-      sleep(1);
-
-      printf("\nmarket rate:  %.8f\n", engine.market_rate());
-      qorder.push(std::make_shared<exchange::Order>(0, 1, 0, 0.00, 30, 0, "alice6"));
-      qorder.push(std::make_shared<exchange::Order>(1, 0, 0, 0.00, 40, 0, "bob6"));
+      static int idx = 0;
       
+      for(int i=0; i<100; i++) {
+
+	//sleep(1);
+	for(int j=0; j<v.size(); ) {
+	  auto type = (i%3 == 0) ? 0 : 1;
+	  qorder.push(std::make_shared<exchange::Order>(idx++, 0, 1, type, 0.5+v[j], v1[j%v1.size()], v1[j%v1.size()]/2, "alice3"));
+	  j++;
+	  qorder.push(std::make_shared<exchange::Order>(idx++, 1, 0, type, v[j], v1[j%v1.size()], v1[j%v1.size()]/2, "bob3"));
+	  j++;
+	  //qorder.push(std::make_shared<exchange::Order>(0, 1, type, 1+v[j], v1[j%v1.size()], 0, "alice3"));
+	  //qorder.push(std::make_shared<exchange::Order>(1, 0, type, v[j], v1[j%v1.size()], 0, "bob3"));
+	}
+      }
+
+      done = true;
+      for(;;) {
+      	int a;
+      	std::cin >> a;
+      	if(a == 0)
+      	  for(int i=0; i<1000; i++) {
+      	    qorder.push(std::make_shared<exchange::Order>(idx++, 0, 1, 1, 0.99, 50, 0, "alice3"));
+      	  }
+      	else
+      	  for(int i=0; i<1000; i++) {
+      	    qorder.push(std::make_shared<exchange::Order>(idx++, 1, 0, 1, 0.01, 50, 0, "bob3"));
+      	  }
+      }
+
     });
+
+  printf("-----------------000\n");
+  while(!done) sleep(1);
+  printf("-----------------001\n");
   
   std::thread matchProc(&exchange::MatchEngine::run, &engine, &alive);
   
   std::thread txDumpProc([&]{
+      //sleep(300);
       for(;;) {
 	auto tx = qtx.pop();
+	static int i = 0;
+	printf("%d ", i++);
 	tx->dump();
       }
     });
