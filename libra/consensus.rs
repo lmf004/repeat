@@ -1,11 +1,27 @@
-pub struct BlockInfo {
-    epoch: u64,
-    round: Round,
+pub struct BlockMetadata {
     id: HashValue,
-    executed_state_id: HashValue,
-    version: Version,
+    round: u64,
     timestamp_usecs: u64,
-    next_epoch_info: Option<EpochInfo>,
+    // The vector has to be sorted to ensure consistent result among all nodes
+    previous_block_votes: Vec<AccountAddress>,
+    proposer: AccountAddress,
+}
+
+pub struct BlockInfo {
+    /// Epoch number corresponds to the set of validators that are active for this block.
+    epoch: u64,
+    /// The consensus protocol is executed in rounds, which monotonically increase per epoch.
+    round: Round,
+    /// The identifier (hash) of the block.
+    id: HashValue,
+    /// The accumulator root hash after executing this block.
+    executed_state_id: HashValue,
+    /// The version of the latest transaction after executing this block.
+    version: Version,
+    /// The timestamp this block was proposed by a proposer.
+    timestamp_usecs: u64,
+    /// An optional field containing the next epoch info
+    next_epoch_state: Option<EpochState>,
 }
 
 pub struct Vote {
@@ -92,224 +108,64 @@ pub struct TransactionInfo {
     status: KeptVMStatus,
 }
 
-pub struct EpochManager<T> {
-    author: Author,
-    config: ConsensusConfig,
-    time_service: Arc<ClockTimeService>,
-    self_sender: channel::Sender<anyhow::Result<Event<ConsensusMsg<T>>>>,
-    network_sender: ConsensusNetworkSender<T>,
-    timeout_sender: channel::Sender<Round>,
-    txn_manager: Box<dyn TxnManager<Payload = T>>,
-    state_computer: Arc<dyn StateComputer<Payload = T>>,
-    storage: Arc<dyn PersistentLivenessStorage<T>>,
-    safety_rules_manager: SafetyRulesManager<T>,
-    processor: Option<Processor<T>>,
+pub enum BlockType {
+    Proposal {
+        payload: Payload,
+        author: Author,
+    },
+    NilBlock,
+    /// A genesis block is the first committed block in any epoch that is identically constructed on
+    /// all validators by any (potentially different) LedgerInfo that justifies the epoch change
+    /// from the previous epoch.  The genesis block is used as the the first root block of the
+    /// BlockTree for all epochs.
+    Genesis,
 }
-
-impl<T: Payload> EpochManager<T> {
-    async fn start_event_processor(
-        &mut self,
-        recovery_data: RecoveryData<T>,
-        epoch_info: EpochInfo,
-    ) {
-        // Release the previous EventProcessor, especially the SafetyRule client
-        self.processor = None;
-        let last_vote = recovery_data.last_vote();
-        let block_store = Arc::new(BlockStore::new(
-            Arc::clone(&self.storage),
-            recovery_data,
-            Arc::clone(&self.state_computer),
-            self.config.max_pruned_blocks_in_mem,
-        ));
-
-        let mut safety_rules = self.safety_rules_manager.client();
-        let consensus_state = safety_rules
-            .consensus_state();
-        let sr_waypoint = consensus_state.waypoint();
-        let proofs = self
-            .storage
-            .retrieve_epoch_change_proof(sr_waypoint.version());
-
-        safety_rules
-            .initialize(&proofs);
-
-        let proposal_generator = ProposalGenerator::new(
-            self.author,
-            block_store.clone(),
-            self.txn_manager.clone(),
-            self.time_service.clone(),
-            self.config.max_block_size,
+impl Block {
+    /// Construct new genesis block for next epoch deterministically from the end-epoch LedgerInfo
+    /// We carry over most fields except round and block id
+    pub fn make_genesis_block_from_ledger_info(ledger_info: &LedgerInfo) -> Self {
+        let block_data = BlockData::new_genesis_from_ledger_info(ledger_info);
+        Block {
+            id: block_data.hash(),
+            block_data,
+            signature: None,
+        }
+    }
+}
+impl BlockData {
+    pub fn new_genesis_from_ledger_info(ledger_info: &LedgerInfo) -> Self {
+        assert!(ledger_info.ends_epoch());
+        let ancestor = BlockInfo::new(
+            ledger_info.epoch(),
+            0,                 /* round */
+            HashValue::zero(), /* parent block id */
+            ledger_info.transaction_accumulator_hash(),
+            ledger_info.version(),
+            ledger_info.timestamp_usecs(),
+            None,
         );
 
-        let pacemaker =
-            self.create_pacemaker(self.time_service.clone(), self.timeout_sender.clone());
-
-        let proposer_election = self.create_proposer_election(&epoch_info);
-        let network_sender = NetworkSender::new(
-            self.author,
-            self.network_sender.clone(),
-            self.self_sender.clone(),
-            epoch_info.verifier.clone(),
+        // Genesis carries a placeholder quorum certificate to its parent id with LedgerInfo
+        // carrying information about version from the last LedgerInfo of previous epoch.
+        let genesis_quorum_cert = QuorumCert::new(
+            VoteData::new(ancestor.clone(), ancestor.clone()),
+            LedgerInfoWithSignatures::new(
+                LedgerInfo::new(ancestor, HashValue::zero()),
+                BTreeMap::new(),
+            ),
         );
 
-        let mut processor = EventProcessor::new(
-            epoch_info,
-            block_store,
-            last_vote,
-            pacemaker,
-            proposer_election,
-            proposal_generator,
-            safety_rules,
-            network_sender,
-            self.txn_manager.clone(),
-            self.storage.clone(),
-            self.time_service.clone(),
-        );
-        processor.start().await;
-        self.processor = Some(Processor::EventProcessor(processor));
+        BlockData::new_genesis(ledger_info.timestamp_usecs(), genesis_quorum_cert)
     }
-
-    pub async fn start(
-        mut self,
-        mut pacemaker_timeout_sender_rx: channel::Receiver<Round>,
-        mut network_receivers: NetworkReceivers<T>,
-        mut reconfig_events: libra_channel::Receiver<(), OnChainConfigPayload>,
-    ) {
-        if let Some(payload) = reconfig_events.next().await {
-            self.start_processor(payload).await;
+    pub fn new_genesis(timestamp_usecs: u64, quorum_cert: QuorumCert) -> Self {
+        assume!(quorum_cert.certified_block().epoch() < u64::max_value()); // unlikely to be false in this universe
+        Self {
+            epoch: quorum_cert.certified_block().epoch() + 1,
+            round: 0,
+            timestamp_usecs,
+            quorum_cert,
+            block_type: BlockType::Genesis,
         }
-        loop {
-            select! {
-                payload = reconfig_events.select_next_some() => {
-                    self.start_processor(payload).await
-                }
-                msg = network_receivers.consensus_messages.select_next_some() => {
-                    self.process_message(msg.0, msg.1).await
-                }
-                block_retrieval = network_receivers.block_retrieval.select_next_some() => {
-                    self.process_block_retrieval(block_retrieval).await
-                }
-                round = pacemaker_timeout_sender_rx.select_next_some() => {
-                    self.process_local_timeout(round).await
-                }
-            }
-        }
-    }
-
-    pub async fn process_message(
-        &mut self,
-        peer_id: AccountAddress,
-        consensus_msg: ConsensusMsg<T>,
-    ) {
-        if let Some(event) = self.process_epoch(peer_id, consensus_msg).await {
-            match event.verify(&self.epoch_info().verifier) {
-                Ok(event) => self.process_event(peer_id, event).await,
-            }
-        }
-    }
-
-    async fn process_epoch(
-        &mut self,
-        peer_id: AccountAddress,
-        msg: ConsensusMsg<T>,
-    ) -> Option<UnverifiedEvent<T>> {
-        match msg {
-            ConsensusMsg::ProposalMsg(_) | ConsensusMsg::SyncInfo(_) | ConsensusMsg::VoteMsg(_) => {
-                let event: UnverifiedEvent<T> = msg.into();
-                if event.epoch() == self.epoch() {
-                    return Some(event);
-                } else {
-                    self.process_different_epoch(event.epoch(), peer_id).await;
-                }
-            }
-            ConsensusMsg::EpochChangeProof(proof) => {
-                let msg_epoch = proof.epoch().map_err(|e| warn!("{:?}", e)).ok()?;
-                if msg_epoch == self.epoch() {
-                    self.start_new_epoch(*proof).await
-                } else {
-                    self.process_different_epoch(msg_epoch, peer_id).await
-                }
-            }
-            ConsensusMsg::EpochRetrievalRequest(request) => {
-                if request.end_epoch <= self.epoch() {
-                    self.process_epoch_retrieval(*request, peer_id).await
-                } 
-            }
-        }
-    }
-
-    async fn process_epoch_retrieval(
-        &mut self,
-        request: EpochRetrievalRequest,
-        peer_id: AccountAddress,
-    ) {
-        let proof = match self
-            .state_computer
-            .get_epoch_proof(request.start_epoch, request.end_epoch)
-            .await
-        {
-            Ok(proof) => proof,
-        };
-        let msg = ConsensusMsg::EpochChangeProof::<T>(Box::new(proof));
-        self.network_sender.send_to(peer_id, msg);
     }
     
-    async fn start_new_epoch(&mut self, proof: EpochChangeProof) {
-        let verifier = VerifierType::TrustedVerifier(self.epoch_info().clone());
-        let ledger_info = match proof.verify(&verifier) {
-            Ok(ledger_info) => ledger_info,
-        };
-        self.state_computer.sync_to(ledger_info.clone());
-    }
-    
-    async fn process_event(&mut self, peer_id: AccountAddress, event: VerifiedEvent<T>) {
-        match self.processor_mut() {
-            Processor::SyncProcessor(p) => {
-                //...
-            }
-            Processor::EventProcessor(p) => match event {
-                VerifiedEvent::ProposalMsg(proposal)
-                    => p.process_proposal_msg(*proposal).await,
-                VerifiedEvent::VoteMsg(vote)
-                    => p.process_vote(*vote).await,
-                VerifiedEvent::SyncInfo(sync_info)
-                    => {
-                        p.process_sync_info_msg(*sync_info, peer_id).await
-                    }
-            },
-        }
-    }
-
-    pub async fn process_block_retrieval(&mut self, request: IncomingBlockRetrievalRequest) {
-        match self.processor_mut() {
-            Processor::EventProcessor(p) => p.process_block_retrieval(request).await,
-        }
-    }
-
-    pub async fn process_local_timeout(&mut self, round: u64) {
-        match self.processor_mut() {
-            Processor::EventProcessor(p) => p.process_local_timeout(round).await,
-        }
-    }    
 }
-
-pub struct EventProcessor<T> {
-    epoch_info: EpochInfo,
-    block_store: Arc<BlockStore<T>>,
-    pending_votes: PendingVotes,
-    pacemaker: Pacemaker,
-    proposer_election: Box<dyn ProposerElection<T> + Send + Sync>,
-    proposal_generator: ProposalGenerator<T>,
-    safety_rules: Box<dyn TSafetyRules<T> + Send + Sync>,
-    network: NetworkSender<T>,
-    txn_manager: Box<dyn TxnManager<Payload = T>>,
-    storage: Arc<dyn PersistentLivenessStorage<T>>,
-    time_service: Arc<dyn TimeService>,
-    // Cache of the last sent vote message.
-    last_vote_sent: Option<(Vote, Round)>,
-}
-
-impl<T: Payload> EventProcessor<T> {
-    
-}
-

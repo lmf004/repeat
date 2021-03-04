@@ -1,0 +1,4 @@
+pub struct StateSynchronizer {
+    _runtime: Runtime,
+    coordinator_sender: mpsc::UnboundedSender<CoordinatorMessage>,
+}

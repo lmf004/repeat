@@ -28,163 +28,6 @@ impl StateComputer for ExecutionProxy {
     }
 }
 
-// epoch_manager.rs
-async fn start_new_epoch(&mut self, proof: EpochChangeProof) -> anyhow::Result<()> {
-    let ledger_info = proof.verify(self.epoch_state());
-    self.state_computer.sync_to(ledger_info.clone());
-}
-async fn start_round_manager(&mut self, recovery_data: RecoveryData, epoch_state: EpochState) {
-    let last_vote = recovery_data.last_vote();
-    let block_store = Arc::new(BlockStore::new(
-        Arc::clone(&self.storage),
-        recovery_data,
-        Arc::clone(&self.state_computer), // lmf
-        self.config.max_pruned_blocks_in_mem,
-        Arc::clone(&self.time_service),
-    ));
-    let mut safety_rules =
-        MetricsSafetyRules::new(self.safety_rules_manager.client(), self.storage.clone());
-    safety_rules
-        .perform_initialize();
-
-    let proposal_generator = ProposalGenerator::new(
-        self.author,
-        block_store.clone(),
-        self.txn_manager.clone(),
-        self.time_service.clone(),
-        self.config.max_block_size,
-    );
-
-    let round_state =
-        self.create_round_state(self.time_service.clone(), self.timeout_sender.clone());
-
-    let proposer_election = self.create_proposer_election(&epoch_state);
-    let network_sender = NetworkSender::new(
-        self.author,
-        self.network_sender.clone(),
-        self.self_sender.clone(),
-        epoch_state.verifier.clone(),
-    );
-
-    let mut processor = RoundManager::new(
-        epoch_state,
-        block_store,
-        round_state,
-        proposer_election,
-        proposal_generator,
-        safety_rules,
-        network_sender,
-        self.txn_manager.clone(),
-        self.storage.clone(),
-        self.config.sync_only,
-    );
-    processor.start(last_vote).await;
-    self.processor = Some(RoundProcessor::Normal(processor));
-}
-
-// block_store.rs
-pub struct BlockStore {
-    inner: Arc<RwLock<BlockTree>>,
-    state_computer: Arc<dyn StateComputer>,
-    storage: Arc<dyn PersistentLivenessStorage>,
-    time_service: Arc<dyn TimeService>,
-}
-fn execute_block(&self, block: Block) -> anyhow::Result<ExecutedBlock, Error> {
-    let state_compute_result = self.state_computer.compute(&block, block.parent_id())?; // lmf
-    Ok(ExecutedBlock::new(block, state_compute_result))
-}
-/// Commit the given block id with the proof, returns () on success or error
-pub async fn commit(&self, finality_proof: LedgerInfoWithSignatures) -> anyhow::Result<()> {
-    let block_id_to_commit = finality_proof.ledger_info().consensus_block_id();
-    let block_to_commit = self.get_block(block_id_to_commit);
-
-    ensure!(block_to_commit.round() > self.root().round());
-
-    let blocks_to_commit = self.path_from_root(block_id_to_commit);
-
-    self.state_computer.commit( // lmf
-        blocks_to_commit.iter().map(|b| b.id()).collect(),
-        finality_proof,
-    );
-    self.prune_tree(block_to_commit.id());
-    Ok(())
-}
-pub fn insert_single_quorum_cert(&self, qc: QuorumCert) -> anyhow::Result<()> {
-    match self.get_block(qc.certified_block().id()) {
-        Some(executed_block) => {
-            ensure!(
-                executed_block.block_info() == *qc.certified_block(),
-                "QC for block {} has different {:?} than local {:?}",
-                qc.certified_block().id(),
-                qc.certified_block(),
-                executed_block.block_info()
-            );
-        }
-        None => bail!("Insert {} without having the block in store first", qc),
-    }
-
-    self.storage.save_tree(vec![], vec![qc.clone()]);
-    self.inner.write().unwrap().insert_quorum_cert(qc)
-}
-pub fn insert_timeout_certificate(&self, tc: Arc<TimeoutCertificate>) -> anyhow::Result<()> {
-    let cur_tc_round = self.highest_timeout_cert().map_or(0, |tc| tc.round());
-    if tc.round() <= cur_tc_round {
-        return Ok(());
-    }
-    self.storage.save_highest_timeout_cert(tc.as_ref().clone());
-    self.inner.write().unwrap().replace_timeout_cert(tc);
-}
-pub fn execute_and_insert_block(&self, block: Block) -> anyhow::Result<Arc<ExecutedBlock>> {
-    if let Some(existing_block) = self.get_block(block.id()) {
-        return Ok(existing_block);
-    }
-    ensure!(self.inner.read().unwrap().root().round() < block.round(), "Block with old round");
-
-    let executed_block = match self.execute_block(block.clone()) {
-        Ok(res) => Ok(res),
-        Err(Error::BlockNotFound(parent_block_id)) => {
-            // recover the block tree in executor
-            let blocks_to_reexecute = self
-                .path_from_root(parent_block_id)
-                .unwrap_or_else(Vec::new);
-
-            for block in blocks_to_reexecute {
-                self.execute_block(block.block().clone())?;
-            }
-            self.execute_block(block)
-        }
-        err => err,
-    }?;
-
-    // ensure local time past the block time
-    let block_time = Duration::from_micros(executed_block.timestamp_usecs());
-    self.time_service.wait_until(block_time);
-    self.storage.save_tree(vec![executed_block.block().clone()], vec![]);
-    self.inner.write().unwrap().insert_block(executed_block)
-}
-
-// round_manager.rs
-async fn execute_and_vote(&mut self, proposed_block: Block) -> anyhow::Result<Vote> {
-    let executed_block = self.block_store.execute_and_insert_block(proposed_block); // lmf
-    // notify mempool about failed txn
-    let compute_result = executed_block.compute_result();
-    self.txn_manager.notify(executed_block.block(), compute_result);
-    // Short circuit if already voted.
-    ensure!(self.round_state.vote_sent().is_none());
-    ensure!(!self.sync_only,"[RoundManager] sync_only flag is set, stop voting");
-    
-    let maybe_signed_vote_proposal = executed_block.maybe_signed_vote_proposal();
-    let vote = self
-        .safety_rules
-        .construct_and_sign_vote(&maybe_signed_vote_proposal)?;
-
-    self.storage.save_vote(&vote)?;
-    Ok(vote)
-}
-
-
-
-
 pub fn start_consensus(
     node_config: &NodeConfig,
     network_sender: ConsensusNetworkSender,
@@ -306,16 +149,25 @@ pub fn setup_environment(node_config: &NodeConfig) -> LibraHandle {
         ));
 
         match role {
+            // Perform steps relevant specifically to Validator networks.
             RoleType::Validator => {
+                // A valid config is allowed to have at most one ValidatorNetwork
+                // TODO:  `expect_none` would be perfect here, once it is stable.
+                if consensus_network_handles.is_some() {
+                    panic!("There can be at most one validator network!");
+                }
+
                 consensus_network_handles =
                     Some(network_builder.add_protocol_handler(
                         consensus::network_interface::network_endpoint_config(),
                     ));
             }
+            // Currently no FullNode network specific steps.
             RoleType::FullNode => (),
         }
 
         reconfig_subscriptions.append(network_builder.reconfig_subscriptions());
+
         network_builders.push(network_builder);
     }
 
@@ -357,7 +209,7 @@ pub fn setup_environment(node_config: &NodeConfig) -> LibraHandle {
 
     if let Some((consensus_network_sender, consensus_network_events)) = consensus_network_handles {
         block_on(state_synchronizer.wait_until_initialized());
-        consensus_runtime = Some(start_consensus( // lmf
+        consensus_runtime = Some(start_consensus(
             node_config,
             consensus_network_sender,
             consensus_network_events,
@@ -378,5 +230,3 @@ pub fn setup_environment(node_config: &NodeConfig) -> LibraHandle {
         _backup: backup_service,
     }
 }
-
-
